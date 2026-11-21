@@ -2954,7 +2954,18 @@ void alloc_prefill() {
     PF.ids = ints(T * TOPK); PF.rows = ints(T * TOPK); PF.slot = ints(T * TOPK);
     PF.tile_e = ints(T * TOPK / FM + NE); PF.tile_r0 = ints(T * TOPK / FM + NE); PF.ntiles = ints(1);
     PF.eoff = ints(NE); PF.ecnt = ints(NE);
-    CK(cudaFuncSetAttribute(kb_attn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) FA_SMEM));
+    {   // the fp32 attention kernel needs FA_SMEM (81.5 KB); Turing allows 64 KB per block (Ampere 163 KB, Ada 99 KB)
+        int dev = 0, optin = 0;
+        CK(cudaGetDevice(&dev));
+        CK(cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev));
+        if ((int) FA_SMEM <= optin) {
+            CK(cudaFuncSetAttribute(kb_attn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) FA_SMEM));
+        } else if (!PF.tc) {
+            std::fprintf(stderr, "this GPU allows %d bytes of shared memory per block, the fp32 attention kernel needs %zu: use --tc 1\n",
+                         optin, (size_t) FA_SMEM);
+            std::exit(2);
+        }
+    }
     if (E.offload) {
         CK(cudaStreamCreateWithFlags(&PF.cs, cudaStreamNonBlocking));
         for (int h = 0; h < 2; ++h) {
