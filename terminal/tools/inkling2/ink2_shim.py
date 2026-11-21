@@ -152,6 +152,9 @@ def make_handler(eng, tok, gen_defaults, model_name):
                     usage = {"prompt_tokens": n_prompt, "completion_tokens": n_gen, "total_tokens": n_prompt + n_gen}
                     timings = {"prompt_n": n_prompt, "prompt_ms": pms, "prompt_per_second": 1000 * n_prompt / max(pms, 1e-3),
                                "predicted_n": n_gen, "predicted_ms": dms, "predicted_per_second": 1000 * n_gen / max(dms, 1e-3)}
+                    extra = dict(x.split("=", 1) for x in done[5:] if "=" in x)   # verifies=N accepted=M (speculative decoding)
+                    if int(extra.get("verifies", 0)):   # a verify checks up to 7 drafted tokens; draft_n is that upper bound
+                        timings["draft_n"], timings["draft_n_accepted"] = 7 * int(extra["verifies"]), int(extra["accepted"])
                 else:
                     usage, timings = None, None
                 if stream:

@@ -4161,6 +4161,7 @@ int main(int argc, char** argv) {
             const bool reuse = !hist.empty() && pr.size() >= hist.size() && std::equal(hist.begin(), hist.end(), pr.begin());
             size_t start = reuse ? hist.size() : 0;
             if (spec && start == pr.size()) start = pr.size() - 1;   // re-fed: the drafter needs its features
+            const long dv0 = spec ? D.verifies : 0, da0 = spec ? D.accepted : 0;   // spec counters at the start of the request
             const double t0 = now_ms();
             if (start == pr.size()) {
                 logits = last_logits;
@@ -4211,7 +4212,8 @@ int main(int argc, char** argv) {
             if (!gen.empty()) hist.insert(hist.end(), gen.begin(), gen.end() - 1);   // the last token was never fed
             last_logits = logits;
             smp.rng = std::move(s.rng);
-            std::printf("DONE %zu %zu %.0f %.0f %s\n", gen.size(), pr.size(), t1 - t0, t2 - t1, finish);
+            std::printf("DONE %zu %zu %.0f %.0f %s verifies=%ld accepted=%ld\n", gen.size(), pr.size(), t1 - t0, t2 - t1, finish,
+                        spec ? D.verifies - dv0 : 0L, spec ? D.accepted - da0 : 0L);
             std::fflush(stdout);
         }
         return 0;
