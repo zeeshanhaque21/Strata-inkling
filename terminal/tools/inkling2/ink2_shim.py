@@ -8,7 +8,7 @@ the request gives none.  Output fields from the model's markers: <|content_think
 
 usage: ink2_shim.py --engine BIN --model DIR [--port 8080] [--ctx 65536] [--chunk 1024] [--tc 1] [--log FILE]
 """
-import argparse, json, subprocess, threading, time, uuid
+import argparse, json, shlex, subprocess, threading, time, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from transformers import AutoTokenizer
@@ -19,7 +19,7 @@ THINK, TEXT, END_MSG, EOS, MSG_MODEL = 200008, 200004, 200010, 200006, 200001
 class Engine:
     def __init__(self, a):
         self.p = subprocess.Popen([a.engine, "--serve", "--model", a.model, "--max-context", str(a.ctx), "--chunk",
-                                   str(a.chunk), "--tc", str(a.tc)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                   str(a.chunk), "--tc", str(a.tc)] + shlex.split(a.engine_args), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                   stderr=open(a.log, "a"), text=True, bufsize=1)
         line = self.p.stdout.readline().split()
         assert line and line[0] == "READY", f"engine did not start: {line}"
@@ -110,7 +110,8 @@ def make_handler(eng, tok, gen_defaults, model_name):
                 ids = ids["input_ids"]
             max_new = int(req.get("max_tokens") or req.get("max_completion_tokens") or 4096)
             keys = {"temperature": req.get("temperature", gen_defaults.get("temperature")), "top_p": req.get("top_p"),
-                    "top_k": req.get("top_k"), "min_p": req.get("min_p"), "seed": req.get("seed")}
+                    "top_k": req.get("top_k"), "min_p": req.get("min_p"), "seed": req.get("seed"),
+                    "ignore_eos": (1 if req.get("ignore_eos") else None)}
             stream = bool(req.get("stream"))
             cid, created = "chatcmpl-" + uuid.uuid4().hex[:24], int(time.time())
             sp = Splitter(tok)
@@ -187,6 +188,7 @@ def main():
     ap.add_argument("--chunk", type=int, default=1024)
     ap.add_argument("--tc", type=int, default=1)
     ap.add_argument("--log", default="/var/ramdisk/inkling/shim-engine.log")
+    ap.add_argument("--engine-args", default="", help="extra engine flags, e.g. '--kv i8 --vram-reserve-mib 2000 --spec 1'")
     a = ap.parse_args()
     tok = AutoTokenizer.from_pretrained(a.model)
     gen_defaults = json.load(open(f"{a.model}/generation_config.json"))

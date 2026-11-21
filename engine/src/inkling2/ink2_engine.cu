@@ -4138,6 +4138,7 @@ int main(int argc, char** argv) {
             std::vector<int> pr = parse_ids(f.back().c_str());
             Sampler s;
             s.rng = std::move(smp.rng);
+            bool ignore_eos = false;   // ignore_eos=1: the end token does not stop the generation (benchmarks of a fixed output length)
             for (size_t k = 2; k + 1 < f.size(); ++k) {   // unknown keys are ignored
                 const size_t eq = f[k].find('=');
                 if (eq == std::string::npos) continue;
@@ -4147,6 +4148,7 @@ int main(int argc, char** argv) {
                 else if (key == "top_k") s.top_k = std::atoi(val.c_str());
                 else if (key == "min_p") s.min_p = std::strtof(val.c_str(), nullptr);
                 else if (key == "seed") s.rng.seed(std::strtoull(val.c_str(), nullptr, 10));
+                else if (key == "ignore_eos") ignore_eos = std::atoi(val.c_str()) != 0;
             }
             if (pr.empty()) { std::printf("ERR empty prompt\n"); std::fflush(stdout); smp.rng = std::move(s.rng); continue; }
             if ((int) pr.size() >= E.ctx) {
@@ -4185,12 +4187,12 @@ int main(int argc, char** argv) {
                 gen.push_back(first);
                 std::printf("T %d\n", first);
                 std::fflush(stdout);
-                if (first == EOS_ID) finish = "stop";
+                if (first == EOS_ID && !ignore_eos) finish = "stop";
                 else spec_continue(first, pos, max_new, s, [&](int t) {
                     gen.push_back(t);
                     std::printf("T %d\n", t);
                     std::fflush(stdout);
-                    if (t == EOS_ID) { finish = "stop"; return false; }
+                    if (t == EOS_ID && !ignore_eos) { finish = "stop"; return false; }
                     return true;
                 }, &stop);
                 if (stop.load() && std::strcmp(finish, "stop") != 0) finish = "cancel";
@@ -4201,7 +4203,7 @@ int main(int argc, char** argv) {
                 gen.push_back(next);
                 std::printf("T %d\n", next);
                 std::fflush(stdout);
-                if (next == EOS_ID) { finish = "stop"; break; }
+                if (next == EOS_ID && !ignore_eos) { finish = "stop"; break; }
                 if (k + 1 < max_new) step(next, pos++, true);
             }
             const double t2 = now_ms();
