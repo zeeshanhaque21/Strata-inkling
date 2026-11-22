@@ -53,6 +53,8 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <sstream>
+#include <fstream>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -1160,6 +1162,169 @@ __global__ void kb_kv_store(const float* kc, const float* vc, void* K, void* V, 
     const size_t row = (size_t) ((pos0 + t) % cap);
     kv_st<false>(K, ksc, row, g * HD + i, kv * fminf(QK_CLIP / (kn + 1e-6f), 1.0f));
     kv_st<true>(V, vsc, row, g * HD + i, vv * vr);
+}
+
+// ---- multi-sequence decode (--slots N): the T tokens of a step are one token each of different sequences.  Token t is
+// sequence seq[t] at position pos[t]; the buffers of sequence q start q * (bytes of one sequence) after the first one.
+// Per token these do what kb_head_clip / kb_conv / kb_hist_store / kb_kv_store and the attention do for a chunk, but a token
+// never reads another token's inputs (they belong to other sequences): its history is its own sequence's ring.
+__global__ void kbm_head_clip(float* v, int sv, const float* scale, int dim, float thr, int log_scaled, const int* pos) {
+    float* x = v + (size_t) blockIdx.y * sv + (size_t) blockIdx.x * dim;
+    const int i = threadIdx.x;
+    float a = i < dim ? x[i] * (scale ? scale[(size_t) blockIdx.x * dim + i] : 1.0f) : 0.0f;
+    const float norm = sqrtf(block_sum(a * a));
+    a *= fminf(thr / (norm + 1e-6f), 1.0f);
+    if (log_scaled) a *= log_scale_at(pos[blockIdx.y]);
+    if (i < dim) x[i] = a;
+}
+__global__ void kbm_conv(const float* __restrict__ x, int sx, const float* __restrict__ hist, size_t hstr, const int* __restrict__ seq,
+                         const float* __restrict__ w, const float* __restrict__ dw, float* __restrict__ y, int sy, int C,
+                         const int* __restrict__ pos) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y, p = pos[t];
+    if (c >= C) return;
+    const float* hs = hist + (size_t) seq[t] * hstr;
+    const float xc = x[(size_t) t * sx + c];
+    float acc;
+    if (dw) {
+        const float* d = dw + (size_t) t * sx + (c / (C / NKV)) * KC;
+        acc = (w[c] + d[0]) * xc;
+        for (int lag = 1; lag < KC; ++lag) {
+            if (p - lag < 0) break;
+            acc += (w[(size_t) lag * C + c] + d[lag]) * hs[(size_t) ((p - lag) % HR) * C + c];
+        }
+        y[(size_t) t * sy + c] = (acc + xc) * rsqrtf((float) (2 * KC + 1));
+    } else {
+        acc = w[(size_t) c * KC + KC - 1] * xc;
+        for (int j = 1; j < KC; ++j) {
+            if (p - j < 0) break;
+            acc += w[(size_t) c * KC + KC - 1 - j] * hs[(size_t) ((p - j) % HR) * C + c];
+        }
+        y[(size_t) t * sy + c] = (acc + xc) * rsqrtf((float) (KC + 1));
+    }
+}
+__global__ void kbm_hist_store(const float* __restrict__ x, int sx, float* __restrict__ hist, size_t hstr, const int* __restrict__ seq,
+                               int C, const int* __restrict__ pos) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
+    if (c < C) hist[(size_t) seq[t] * hstr + (size_t) (pos[t] % HR) * C + c] = x[(size_t) t * sx + c];
+}
+// grid (NKV, T), block HD
+__global__ void kbm_kv_store(const float* kc, const float* vc, void* K, void* V, __half* ksc, __half* vsc, int cap, size_t kb, size_t vb,
+                             size_t ksb, size_t vsb, const int* seq, const int* pos) {
+    const int g = blockIdx.x, t = blockIdx.y, i = threadIdx.x, q = seq[t];
+    const float kv = kc[(size_t) t * KVD + g * HD + i], vv = vc[(size_t) t * KVD + g * HD + i];
+    const float kn = sqrtf(block_sum(kv * kv));
+    const float vr = rsqrtf(block_sum(vv * vv) / HD + EPS);
+    const size_t row = (size_t) (pos[t] % cap);
+    void* Kt = static_cast<uint8_t*>(K) + (size_t) q * kb;
+    void* Vt = static_cast<uint8_t*>(V) + (size_t) q * vb;
+    __half* kst = ksc ? reinterpret_cast<__half*>(reinterpret_cast<uint8_t*>(ksc) + (size_t) q * ksb) : nullptr;
+    __half* vst = vsc ? reinterpret_cast<__half*>(reinterpret_cast<uint8_t*>(vsc) + (size_t) q * vsb) : nullptr;
+    kv_st<false>(Kt, kst, row, g * HD + i, kv * fminf(QK_CLIP / (kn + 1e-6f), 1.0f));
+    kv_st<true>(Vt, vst, row, g * HD + i, vv * vr);
+}
+// partial attention of token blockIdx.z, head blockIdx.x, chunk blockIdx.y: k_attn_partial for the token's own sequence.  q, sink and gate are
+// read from the projection rows P [T][sp]; rel [T][NQ][EXTENT]; partials [T][NQ][nchunk]
+__global__ void kbm_attn_partial(const float* __restrict__ P, int sp, const void* __restrict__ K, const void* __restrict__ V,
+                                 const __half* __restrict__ ksc, const __half* __restrict__ vsc, size_t kb, size_t vb, size_t ksb,
+                                 size_t vsb, const float* __restrict__ rel, int cap, int window, const int* __restrict__ seq,
+                                 const int* __restrict__ pos, float* __restrict__ pm, float* __restrict__ pl, float* __restrict__ po) {
+    __shared__ __align__(16) float qs[HD];
+    __shared__ float lg[CHUNK];
+    const int h = blockIdx.x, c = blockIdx.y, t = blockIdx.z, g = h / NREP, tid = threadIdx.x, lane = tid & 31, wp = tid / 32;
+    const int pos_t = pos[t], q = seq[t];
+    const void* Kt = static_cast<const uint8_t*>(K) + (size_t) q * kb;
+    const void* Vt = static_cast<const uint8_t*>(V) + (size_t) q * vb;
+    const __half* kst = ksc ? reinterpret_cast<const __half*>(reinterpret_cast<const uint8_t*>(ksc) + (size_t) q * ksb) : nullptr;
+    const __half* vst = vsc ? reinterpret_cast<const __half*>(reinterpret_cast<const uint8_t*>(vsc) + (size_t) q * vsb) : nullptr;
+    const float* relh = rel + ((size_t) t * NQ + h) * EXTENT;
+    const int span = window > 0 ? min(pos_t + 1, window) : pos_t + 1;   // distances 0 .. span-1
+    const int d0 = c * CHUNK, n = min(CHUNK, span - d0);
+    const size_t part = ((size_t) t * NQ + h) * gridDim.y + c;
+    if (n <= 0) {
+        if (!tid) { pm[part] = -INFINITY; pl[part] = 0.0f; }
+        po[part * HD + tid] = 0.0f;
+        return;
+    }
+    qs[tid] = P[(size_t) t * sp + h * HD + tid];
+    __syncthreads();
+    const float scale = rsqrtf((float) HD);
+    const int r0 = (pos_t - d0) % cap;   // ring slot of distance d0 + k: r0 - k, wrapped once
+    {
+        const int sub = lane & 7;
+        const float4* q4 = reinterpret_cast<const float4*>(qs);
+        for (int k0 = wp * 4; k0 < n; k0 += 16) {
+            const int k = k0 + (lane >> 3);
+            float a = 0.0f;
+            if (k < n) {
+                const int r = r0 - k < 0 ? r0 - k + cap : r0 - k;
+                float4 kv[4];
+#pragma unroll
+                for (int u = 0; u < 4; ++u) kv[u] = kv_ld4<false>(Kt, kst, (size_t) r, g * HD + 4 * (sub + 8 * u));
+#pragma unroll
+                for (int u = 0; u < 4; ++u) {
+                    const float4 qv = q4[sub + 8 * u];
+                    a += qv.x * kv[u].x + qv.y * kv[u].y + qv.z * kv[u].z + qv.w * kv[u].w;
+                }
+            }
+            a += __shfl_xor_sync(0xffffffffu, a, 4);
+            a += __shfl_xor_sync(0xffffffffu, a, 2);
+            a += __shfl_xor_sync(0xffffffffu, a, 1);
+            const int dist = d0 + k;
+            if (!sub && k < n) lg[k] = a * scale + (dist < EXTENT ? relh[dist] : 0.0f);
+        }
+    }
+    __syncthreads();
+    float mx = -INFINITY;
+    for (int k = tid; k < n; k += blockDim.x) mx = fmaxf(mx, lg[k]);
+    mx = block_max(mx);
+    float s = 0.0f;
+    for (int k = tid; k < n; k += blockDim.x) { lg[k] = expf(lg[k] - mx); s += lg[k]; }
+    s = block_sum(s);
+    __syncthreads();
+    __shared__ float4 red[4][HD / 4];
+    float4 o4 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    const int ve = g * HD + 4 * lane;
+    if (c_kvm == 4) {
+#pragma unroll 4
+        for (int k = wp; k < n; k += 4) {
+            const int r = r0 - k < 0 ? r0 - k + cap : r0 - k;
+            const float4 v = kv_ld4<true>(Vt, vst, (size_t) r, ve);
+            const float pk = lg[k];
+            o4.x += pk * v.x; o4.y += pk * v.y; o4.z += pk * v.z; o4.w += pk * v.w;
+        }
+    } else {
+#pragma unroll 4
+        for (int k = wp; k < n; k += 4) {
+            const int r = r0 - k < 0 ? r0 - k + cap : r0 - k;
+            const float4 v = kv_ld4<false>(Vt, vst, (size_t) r, ve);
+            const float pk = lg[k];
+            o4.x += pk * v.x; o4.y += pk * v.y; o4.z += pk * v.z; o4.w += pk * v.w;
+        }
+    }
+    red[wp][lane] = o4;
+    __syncthreads();
+    const float* rf = reinterpret_cast<const float*>(red);
+    const float o = rf[tid] + rf[HD + tid] + rf[2 * HD + tid] + rf[3 * HD + tid];
+    if (!tid) { pm[part] = mx; pl[part] = s; }
+    po[part * HD + tid] = o;
+}
+// merge the chunks of each (token, head) with the head's sink logit (zero value): att[t][h][HD] (the output gate and the V rotation follow)
+__global__ void kbm_attn_merge(const float* __restrict__ P, int sp, const float* __restrict__ pm, const float* __restrict__ pl,
+                               const float* __restrict__ po, int nchunk, float* __restrict__ att) {
+    const int h = blockIdx.x, t = blockIdx.y, tid = threadIdx.x;
+    const float sink = P[(size_t) t * sp + OFF_SINK + h];
+    const size_t base = ((size_t) t * NQ + h) * nchunk;
+    float M = sink;
+    for (int c = 0; c < nchunk; ++c) M = fmaxf(M, pm[base + c]);
+    float L = expf(sink - M), o = 0.0f;
+    for (int c = 0; c < nchunk; ++c) {
+        const float m = pm[base + c];
+        if (m == -INFINITY) continue;
+        const float f = expf(m - M);
+        L += f * pl[base + c];
+        o += f * po[(base + c) * HD + tid];
+    }
+    att[(size_t) t * QD + h * HD + tid] = o / L;
 }
 
 // rel[t][h][d] = sum_r rs_t[h][r] proj[r][d]; grid (NQ, T)
@@ -2826,6 +2991,8 @@ struct Slot {
     int cap = 0;
     bool full = false;
     float *khist, *vhist, *ahist, *mhist;   // [HR][C]
+    size_t seq_bytes[4] = {0, 0, 0, 0};     // multi-sequence decode (--slots N): the buffers hold N sequences back to back; bytes of one
+                                            //   sequence's K, V, ksc, vsc (the histories: HR * C floats)
 };
 
 struct Bells { ink2cpu::InkBell* b[2]; };   // device views of the per-node doorbells
@@ -2855,6 +3022,8 @@ struct Engine {
     Layer L[NL];
     Slot S[NCALLS];
     int* d_pos;
+    int nseq = 1;                // --slots N: sequences held (N copies of every slot's buffers)
+    int *ms_seq = nullptr, *ms_pos = nullptr;   // multi-sequence decode: token t's sequence and position (device, [MS_MAX])
     // activations
     float *h, *out, *Bbuf, *preB, *pre_h, *prev_stack, *msgs;
     float *a, *t[4], *xq, *xk, *xv, *q, *k, *v, *kc, *vc, *dw, *rs, *rel, *sink, *gate, *att, *attn_out, *att2, *r;
@@ -2925,12 +3094,31 @@ size_t ex_layer_off(int l) {   // offset of layer l's first expert in the reside
 }
 size_t pool_slot(bool nv) { return ex_bytes(nv ? 0 : NL - 1); }   // bytes of a pool_nv / pool_mx slot (offload)
 int g_slot = 0;   // the layer application being built (host side, baked into the launches)
+int g_seq = 0;    // the sequence the one-sequence paths (prompt chunks) work on (--slots N)
+int g_ms = 0;     // > 0: a multi-sequence decode step of that many tokens is being built (token t = one token of sequence ms_seq[t])
+constexpr int MS_MAX = 8;
 int g_rpw = 4;    // decode GEMV rows per warp, upper bound (INK2_RPW: 1, 2, 4, 8)
 int g_sel_rpw = 2;   // expert (selected) GEMV rows per warp (INK2_SEL_RPW: 1, 2, 4, 8)
 int g_grp_r = 4;   // small-T grouped expert GEMV rows per warp (INK2_GRP_R: 1, 2, 4)
 int g_gemv_min_blocks = 164;   // bf16 GEMV: R halved until the grid has this many blocks (2 per SM; INK2_GEMV_MINB)
 
 Engine E;
+
+// a view of sequence q of a slot (--slots N): the same slot with every buffer advanced by q sequences
+Slot seq_slot(const Slot& s0, int q) {
+    Slot r = s0;
+    if (q <= 0) return r;
+    auto adv = [&](void* p, size_t bytes) -> void* { return p ? static_cast<uint8_t*>(p) + (size_t) q * bytes : nullptr; };
+    r.K = adv(s0.K, s0.seq_bytes[0]);
+    r.V = adv(s0.V, s0.seq_bytes[1]);
+    r.ksc = static_cast<__half*>(adv(s0.ksc, s0.seq_bytes[2]));
+    r.vsc = static_cast<__half*>(adv(s0.vsc, s0.seq_bytes[3]));
+    r.khist = s0.khist + (size_t) q * HR * KVD;
+    r.vhist = s0.vhist + (size_t) q * HR * KVD;
+    r.ahist = s0.ahist + (size_t) q * HR * H;
+    r.mhist = s0.mhist + (size_t) q * HR * H;
+    return r;
+}
 
 DMat dmat(const std::string& name) {
     const StTensor& t = E.ck->t(name);
@@ -3654,9 +3842,12 @@ void alloc_state() {
         S.full = full_layer(l);
         S.cap = S.full ? E.ctx : WINDOW + PF_RING_EXTRA;
         void** arr[4] = {&S.K, &S.V, (void**) &S.ksc, (void**) &S.vsc};
+        const int NS = std::max(1, E.nseq);
+        if (NS > 1 && E.grow) { std::fprintf(stderr, "--slots N does not combine with --kv-grow\n"); std::exit(2); }
         for (int a = 0; a < 4; ++a) {
             const size_t b = kv_cell_bytes(a);
             if (!b) continue;
+            S.seq_bytes[a] = (size_t) S.cap * b;
             if (E.grow && S.full) {
                 g_kvr.emplace_back();
                 VRange& r = g_kvr.back();
@@ -3664,13 +3855,13 @@ void alloc_state() {
                 g_kvr_bpc.push_back(b);
                 *arr[a] = r.ptr();
             } else {
-                *arr[a] = dalloc((size_t) S.cap * b);
+                *arr[a] = dalloc((size_t) NS * S.cap * b);
             }
         }
-        S.khist = dfloats(HR * KVD);
-        S.vhist = dfloats(HR * KVD);
-        S.ahist = dfloats(HR * H);
-        S.mhist = dfloats(HR * H);
+        S.khist = dfloats((size_t) NS * HR * KVD);
+        S.vhist = dfloats((size_t) NS * HR * KVD);
+        S.ahist = dfloats((size_t) NS * HR * H);
+        S.mhist = dfloats((size_t) NS * HR * H);
     }
     if (E.grow) {
         E.kv_cells = std::min(E.ctx, E.grow_step);
@@ -3678,6 +3869,8 @@ void alloc_state() {
             if (!g_kvr[i].map_to((size_t) E.kv_cells * g_kvr_bpc[i])) { std::fprintf(stderr, "--kv-grow: no VRAM for %d cells\n", E.kv_cells); std::exit(1); }
     }
     E.d_pos = (int*) dalloc(4);
+    E.ms_seq = (int*) dalloc(MS_MAX * 4);
+    E.ms_pos = (int*) dalloc(MS_MAX * 4);
     E.h = dfloats(H); E.out = dfloats(H); E.Bbuf = dfloats(8 * H); E.preB = dfloats(8 * H); E.pre_h = dfloats(H);
     E.prev_stack = dfloats(8 * H); E.msgs = dfloats(4 * H); E.a = dfloats(3 * H);
     for (auto& t : E.t) t = dfloats(H);
@@ -4474,6 +4667,7 @@ void forward_device() {
 // the fly), attention tiled (kb_attn).  It fills the same KV / conv state as the one-token path, which then decodes.
 
 struct Prefill {
+    float *ms_pm = nullptr, *ms_pl = nullptr, *ms_po = nullptr;   // multi-sequence attention partials [MS_MAX][NQ][nchunk] (x HD)
     int TP = 512;   // chunk capacity
     bool tc = false;   // --tc 1: fp16 tensor-core products (NVFP4 experts, attention proj / wo)
     cublasHandle_t cb = nullptr, cbh = nullptr;   // fp32 (pedantic) / fp16 tensor-op handles
@@ -4540,6 +4734,12 @@ void pf_layout(int T) {
 }
 
 void alloc_prefill() {
+    if (E.nseq > 1) {   // multi-sequence decode: the partial results of the per-token attention
+        const size_t nc = std::max(E.nchunk_full, E.nchunk_slide);
+        PF.ms_pm = dfloats((size_t) MS_MAX * NQ * nc);
+        PF.ms_pl = dfloats((size_t) MS_MAX * NQ * nc);
+        PF.ms_po = dfloats((size_t) MS_MAX * NQ * nc * HD);
+    }
     g_pfr.reserve(64);
     const size_t T = PF.TP, TH = T * H;
     CK(cublasCreate(&PF.cb) == CUBLAS_STATUS_SUCCESS ? cudaSuccess : cudaErrorUnknown);
@@ -4766,6 +4966,11 @@ void message_gate_b(const Gate& g, const float* x, int sx, const float* m, int s
 }
 
 void conv_b(const float* x, int sx, float* hist, const float* w, const float* dw, float* y, int sy, int C, int T, int pos0) {
+    if (g_ms) {   // one token of each of T sequences: each reads and writes its own sequence's ring (the sequence stride is HR * C floats)
+        kbm_conv<<<dim3(C / 256, T), 256>>>(x, sx, hist, (size_t) HR * C, E.ms_seq, w, dw, y, sy, C, E.ms_pos);
+        kbm_hist_store<<<dim3(C / 256, T), 256>>>(x, sx, hist, (size_t) HR * C, E.ms_seq, C, E.ms_pos);
+        return;
+    }
     kb_conv<<<dim3(C / 256, T), 256>>>(x, sx, hist, w, dw, y, sy, C, pos0);
     kb_hist_store<<<dim3(C / 256, std::min(HR, T)), 256>>>(x, sx, hist, C, T, pos0);
 }
@@ -4800,7 +5005,8 @@ void attention_b(const Layer& Y, Slot& S, const float* xq, int sq, const float* 
         sgemm(W + (size_t) Y.off_k * H, Y.n_k, H, xk, sk, P + Y.off_k, np, T);
         sgemm(W + (size_t) Y.off_v * H, Y.n_v, H, xv, sv, P + Y.off_v, np, T);
     }
-    kb_head_clip<<<dim3(NQ, T), 128>>>(P, np, Y.q_scale, HD, QK_CLIP, Y.full, pos0);
+    if (g_ms) kbm_head_clip<<<dim3(NQ, T), 128>>>(P, np, Y.q_scale, HD, QK_CLIP, Y.full, E.ms_pos);
+    else kb_head_clip<<<dim3(NQ, T), 128>>>(P, np, Y.q_scale, HD, QK_CLIP, Y.full, pos0);
     if (E.kvm == 3) kb_wht<<<dim3(NQ, T), 128>>>(P, np);
     float *k = P + Y.off_k, *v = P + Y.off_v;
     if (Y.full) {
@@ -4810,10 +5016,21 @@ void attention_b(const Layer& Y, Slot& S, const float* xq, int sq, const float* 
         conv_b(k, np, S.khist, Y.k_conv, nullptr, PF.kc, KVD, KVD, T, pos0);
         conv_b(v, np, S.vhist, Y.v_conv, nullptr, PF.vc, KVD, KVD, T, pos0);
     }
+    if (g_ms) {
+        kbm_kv_store<<<dim3(NKV, T), HD>>>(PF.kc, PF.vc, S.K, S.V, S.ksc, S.vsc, S.cap, S.seq_bytes[0], S.seq_bytes[1], S.seq_bytes[2],
+                                           S.seq_bytes[3], E.ms_seq, E.ms_pos);
+        kbm_head_clip<<<dim3(NQ, T), 128>>>(P + OFF_REL, np, Y.rel_scale, DREL, REL_CLIP, Y.full, E.ms_pos);
+    } else {
     kb_kv_store<<<dim3(NKV, T), HD>>>(PF.kc, PF.vc, S.K, S.V, S.ksc, S.vsc, S.cap, pos0);
     kb_head_clip<<<dim3(NQ, T), 128>>>(P + OFF_REL, np, Y.rel_scale, DREL, REL_CLIP, Y.full, pos0);
+    }
     kb_rel_logits<<<dim3(NQ, T), 256>>>(P + OFF_REL, np, Y.rel_proj, PF.rel);
-    if (PF.tc) {
+    if (g_ms) {   // every token attends its own sequence's keys (decode-style attention, one launch for all T tokens)
+        const int nch = S.full ? E.nchunk_full : E.nchunk_slide;
+        kbm_attn_partial<<<dim3(NQ, nch, T), 128>>>(P, np, S.K, S.V, S.ksc, S.vsc, S.seq_bytes[0], S.seq_bytes[1], S.seq_bytes[2], S.seq_bytes[3],
+                                                    PF.rel, S.cap, S.full ? 0 : WINDOW, E.ms_seq, E.ms_pos, PF.ms_pm, PF.ms_pl, PF.ms_po);
+        kbm_attn_merge<<<dim3(NQ, T), HD>>>(P, np, PF.ms_pm, PF.ms_pl, PF.ms_po, nch, PF.att);
+    } else if (PF.tc) {
         const size_t nqh = (size_t) T * QD;
         kb_f32_to_f16<<<(unsigned) ((nqh + 255) / 256), 256>>>(P, np, QD, PF.qh, nqh);
         // verify blocks: the keys split over blocks (8 blocks would walk the whole context otherwise)
@@ -5636,7 +5853,7 @@ void forward_prefill(const int* toks, int T, int pos0, float* all) {
         CK(cudaMemcpyAsync(PF.x0, e.data(), ES * 4, cudaMemcpyHostToDevice, cudaStreamPerThread));
         CK(cudaStreamSynchronize(cudaStreamPerThread));
     }
-    if (PF.rows_argmax && E.graph && T == DBLK) {   // verify block (offload: through the decode cache): one graph per output variant
+    if (PF.rows_argmax && E.graph && T == DBLK && !g_ms) {   // verify block (offload: through the decode cache): one graph per output variant
         cudaGraphExec_t& x = g_vexec[PF.rows_copy ? 1 : 0];
         CK(cudaMemcpyToSymbolAsync(d_vpos, &pos0, 4, 0, cudaMemcpyHostToDevice, cudaStreamPerThread));
         if (!x) {
@@ -5672,7 +5889,8 @@ void forward_prefill_device(int T, int pos0, float* all) {
                                      T, cudaMemcpyDeviceToDevice, cudaStreamPerThread));
         }
         ++visit;
-        layer_forward_b(l, E.S[slot], nB, msgs, T, pos0);
+        Slot sv = g_ms ? E.S[slot] : seq_slot(E.S[slot], g_seq);   // (multi-sequence: sequence 0's base, the kernels index by token)
+        layer_forward_b(l, sv, nB, msgs, T, pos0);
         if (l % BLOCK == 0) ++nB;
         std::swap(PF.h, PF.out);
     };
@@ -5721,6 +5939,97 @@ void forward_prefill_device(int T, int pos0, float* all) {
                                  cudaMemcpyDeviceToHost, cudaStreamPerThread));
         }
     }
+}
+
+// ---- multi-sequence decode test (--ms-test a.ids,b.ids,... --slots N --n STEPS): B sequences prefilled into B slots, STEPS greedy
+// steps in lockstep (one token of each per forward), then each sequence again alone through the same path: every token must match.
+double now_ms();
+std::vector<int> parse_ids(const char* s);
+void ms_test(const std::vector<std::string>& files, int steps) {
+    std::vector<std::vector<int>> prompts;
+    for (const auto& f : files) {
+        std::ifstream in(f);
+        std::stringstream ss;
+        ss << in.rdbuf();
+        prompts.push_back(parse_ids(ss.str().c_str()));
+        if (prompts.back().empty()) { std::fprintf(stderr, "ms-test: no token ids in %s\n", f.c_str()); std::exit(2); }
+    }
+    const int B = (int) prompts.size();
+    if (B > E.nseq) { std::fprintf(stderr, "ms-test: %d prompts but --slots %d\n", B, E.nseq); std::exit(2); }
+    if (!PF.am) PF.am = (int*) dalloc(MS_MAX * 4);
+    auto prefill = [&](int sq) -> int {
+        g_seq = sq;
+        PF.rows_argmax = PF.rows_copy = false;
+        const auto& ids = prompts[sq];
+        for (size_t p0 = 0; p0 < ids.size(); p0 += PF.TP) {
+            const int T = (int) std::min((size_t) PF.TP, ids.size() - p0);
+            forward_prefill(&ids[p0], T, (int) p0, nullptr);
+        }
+        g_seq = 0;
+        std::vector<float> lg(VOCAB);
+        CK(cudaMemcpy(lg.data(), E.logits, (size_t) VOCAB * 4, cudaMemcpyDeviceToHost));
+        return (int) (std::max_element(lg.begin(), lg.end()) - lg.begin());
+    };
+    auto step_ms = [&](const std::vector<int>& toks, const std::vector<int>& seqs, const std::vector<int>& pos) {
+        const int n = (int) toks.size();
+        CK(cudaMemcpy(E.ms_seq, seqs.data(), (size_t) n * 4, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(E.ms_pos, pos.data(), (size_t) n * 4, cudaMemcpyHostToDevice));
+        g_ms = n;
+        PF.rows_argmax = true;
+        PF.rows_copy = false;
+        forward_prefill(toks.data(), n, 0, nullptr);
+        PF.rows_argmax = false;
+        g_ms = 0;
+        std::vector<int> am((size_t) n);
+        CK(cudaMemcpy(am.data(), PF.am, (size_t) n * 4, cudaMemcpyDeviceToHost));
+        return am;
+    };
+    // 1. lockstep
+    std::vector<int> cur(B), len(B);
+    std::vector<std::vector<int>> out_b(B);
+    for (int sq = 0; sq < B; ++sq) { cur[sq] = prefill(sq); len[sq] = (int) prompts[sq].size(); out_b[sq].push_back(cur[sq]); }
+    std::vector<int> seqs(B);
+    for (int sq = 0; sq < B; ++sq) seqs[sq] = sq;
+    step_ms(cur, seqs, len);   // warm-up step (cuBLAS, first launches); it also writes position len, rewritten below
+    for (int sq = 0; sq < B; ++sq) { cur[sq] = prefill(sq); }   // back to the state right after the prompt
+    for (int sq = 0; sq < B; ++sq) { out_b[sq].assign(1, cur[sq]); }
+    const double t0 = now_ms();
+    for (int k = 1; k < steps; ++k) {
+        std::vector<int> pos(B);
+        for (int sq = 0; sq < B; ++sq) pos[sq] = len[sq] + k - 1;
+        const std::vector<int> nx = step_ms(cur, seqs, pos);
+        for (int sq = 0; sq < B; ++sq) { cur[sq] = nx[sq]; out_b[sq].push_back(nx[sq]); }
+    }
+    const double t_batch = now_ms() - t0;
+    // 2. each sequence alone through the same path
+    std::vector<std::vector<int>> out_a(B);
+    double t_alone = 0.0;
+    for (int sq = 0; sq < B; ++sq) {
+        int c = prefill(sq);
+        out_a[sq].push_back(c);
+        const double a0 = now_ms();
+        for (int k = 1; k < steps; ++k) {
+            const std::vector<int> nx = step_ms({c}, {sq}, {len[sq] + k - 1});
+            c = nx[0];
+            out_a[sq].push_back(c);
+        }
+        t_alone += now_ms() - a0;
+    }
+    int bad = 0;
+    for (int sq = 0; sq < B; ++sq) {
+        int first = -1;
+        for (int k = 0; k < steps; ++k) if (out_a[sq][k] != out_b[sq][k]) { first = k; break; }
+        std::printf("seq %d (%zu prompt tokens): %s", sq, prompts[sq].size(), first < 0 ? "batched == alone for all steps" : "MISMATCH");
+        if (first >= 0) { ++bad; std::printf(" at step %d (batched %d, alone %d)", first, out_b[sq][first], out_a[sq][first]); }
+        std::printf(" | first tokens:");
+        for (int k = 0; k < std::min(steps, 8); ++k) std::printf(" %d", out_b[sq][k]);
+        std::printf("\n");
+    }
+    const double toks = (double) B * (steps - 1);
+    std::printf("ms-test: %d sequences x %d steps: batched %.1f ms (%.1f tok/s aggregate, %.1f tok/s each, %.2f ms/step), "
+                "alone one after another %.1f ms (%.1f tok/s aggregate) -> %.2fx; %s\n",
+                B, steps - 1, t_batch, toks * 1000.0 / t_batch, (steps - 1) * 1000.0 / t_batch, t_batch / (steps - 1), t_alone,
+                toks * 1000.0 / t_alone, t_alone / t_batch, bad ? "EQUIVALENCE FAILED" : "EQUIVALENT");
 }
 
 std::vector<int> parse_ids(const char* s) {
@@ -5826,7 +6135,7 @@ int main(int argc, char** argv) {
 #endif
         CK(cudaMemcpyToSymbol(c_q8w, &w, sizeof(int)));
     }
-    std::string dir, dump_logits, rec_path;
+    std::string dir, dump_logits, rec_path, ms_test_files;
     std::vector<std::string> vis_paths;   // --image (one per placeholder of --tokens, in order)
     std::string vis_pixels;               // --vis-pixels: the ViT alone on a processor pixel tensor
     std::vector<int> ids;
@@ -5855,6 +6164,8 @@ int main(int argc, char** argv) {
         else if (a == "--chunk") PF.TP = std::atoi(v);
         else if (a == "--tc") PF.tc = std::atoi(v) != 0;
         else if (a == "--vram-reserve-mib") E.reserve_mib = std::atoi(v);
+        else if (a == "--ms-test") ms_test_files = v;
+        else if (a == "--slots") E.nseq = std::max(1, std::min(MS_MAX, std::atoi(v)));   // sequences held for multi-sequence decode
         else if (a == "--spec") spec = std::atoi(v) != 0;
         else if (a == "--cpu-threads") E.cpu_threads = std::atoi(v);
         else if (a == "--kv-grow") E.grow = std::atoi(v) != 0;
@@ -5973,6 +6284,17 @@ int main(int argc, char** argv) {
     step(0, 0, false);
     CK(cudaDeviceSynchronize());
     std::fprintf(stderr, "load %.1f s, %.2f GiB in VRAM (ctx %d)\n", (now_ms() - t_load) / 1000, g_vram / 1073741824.0, E.ctx);
+    if (!ms_test_files.empty()) {
+        std::vector<std::string> fl;
+        for (size_t a0 = 0; a0 <= ms_test_files.size();) {
+            size_t e0 = ms_test_files.find(',', a0);
+            if (e0 == std::string::npos) e0 = ms_test_files.size();
+            if (e0 > a0) fl.push_back(ms_test_files.substr(a0, e0 - a0));
+            a0 = e0 + 1;
+        }
+        ms_test(fl, n_gen);
+        return 0;
+    }
 
     // Speculative continuation (--spec): `first` was sampled for position p (not fed yet; already emitted by the
     // caller).  Draft 7 / verify 8 until emit() returns false, max_new tokens in all, or stop; the target's per-row
