@@ -1847,7 +1847,10 @@ __global__ void __launch_bounds__(256) kb_moe_gemm_tc(const half* __restrict__ A
                                                       const int* __restrict__ tile_r0, const int* __restrict__ ntiles,
                                                       const int* __restrict__ eoff, const int* __restrict__ ecnt,
                                                       float* __restrict__ C, int N, int K) {
-    __shared__ __align__(32) unsigned char smraw[TM * TCLD * 4];   // As + Bs during the loop, C staging after
+    // As + Bs during the loop (15.4 KB), then the C staging of half the tile (32 rows, 16.9 KB): 2 blocks per SM fit on Turing's
+    // 64 KB (the whole 64-row staging tile was 33.8 KB: 1 block per SM, 25 % occupancy)
+    static_assert(TM * TLD * 2 + TN * TLD * 2 <= (TM / 2) * TCLD * 4, "staging buffer covers As + Bs");
+    __shared__ __align__(32) unsigned char smraw[(TM / 2) * TCLD * 4];
     half* As = reinterpret_cast<half*>(smraw);
     half* Bs = As + TM * TLD;
     float* Cs = reinterpret_cast<float*>(smraw);
@@ -1858,14 +1861,16 @@ __global__ void __launch_bounds__(256) kb_moe_gemm_tc(const half* __restrict__ A
     const uint8_t* S = W + (size_t) N * (NV ? K / 2 : K);
     const int tid = threadIdx.x, warp = tid / 32, wm = warp / 4, wn = warp % 4;
     // A: fp16 rows in expert order (gathered / converted once per layer, not once per N block): 16 B per thread
-    const int arow = tid / 4, akq = tid % 4;
+    // lane -> (row, 16 B chunk): a quarter warp (the 8 lanes of one shared-store phase) takes 8 consecutive rows of the same chunk, whose
+    // 80 B-strided addresses hit 8 different bank groups (rows 0-1 x chunks 0-3 collided 2-way); a warp still reads 8 rows x 64 B
+    const int arow = (tid / 32) * 8 + (tid % 8), akq = (tid % 32) / 8;
     const half* asrc = r0 + arow < rend ? A + (size_t) (r0 + arow) * lda + akq * 8 : nullptr;
     int wn_[2], wq_[2];
 #pragma unroll
     for (int u = 0; u < 2; ++u) {
         const int idx = tid + 256 * u;
-        wn_[u] = idx / 4;
-        wq_[u] = idx % 4;
+        wn_[u] = (idx / 32) * 8 + (idx % 8);
+        wq_[u] = (idx % 32) / 8;
     }
     wmma::fragment<wmma::accumulator, 16, 16, 16, float> c[2][2];
 #pragma unroll
@@ -1936,19 +1941,25 @@ __global__ void __launch_bounds__(256) kb_moe_gemm_tc(const half* __restrict__ A
         }
         __syncthreads();
     }
-#pragma unroll
-    for (int i = 0; i < 2; ++i)
-#pragma unroll
-        for (int j = 0; j < 2; ++j)
-            wmma::store_matrix_sync(Cs + (wm * 32 + i * 16) * TCLD + wn * 32 + j * 16, c[i][j], TCLD, wmma::mem_row_major);
-    __syncthreads();
     const float f = NV ? factors[e] : 1.0f / 1024.0f;
 #pragma unroll
-    for (int u = 0; u < 8; ++u) {
-        const int idx = tid + 256 * u, row = idx / 32, c4 = idx % 32, r = r0 + row;
-        if (r >= rend) continue;
-        const float4 v = *reinterpret_cast<const float4*>(Cs + row * TCLD + c4 * 4);
-        *reinterpret_cast<float4*>(C + (size_t) r * N + n0 + c4 * 4) = make_float4(v.x * f, v.y * f, v.z * f, v.w * f);
+    for (int h = 0; h < 2; ++h) {   // rows [32 h, 32 h + 32) of the tile: the warps with wm == h stage their accumulators, all copy out
+        if (wm == h) {
+#pragma unroll
+            for (int i = 0; i < 2; ++i)
+#pragma unroll
+                for (int j = 0; j < 2; ++j)
+                    wmma::store_matrix_sync(Cs + (i * 16) * TCLD + wn * 32 + j * 16, c[i][j], TCLD, wmma::mem_row_major);
+        }
+        __syncthreads();
+#pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            const int idx = tid + 256 * u, row = idx / 32, c4 = idx % 32, r = r0 + h * 32 + row;
+            if (r >= rend) continue;
+            const float4 v = *reinterpret_cast<const float4*>(Cs + row * TCLD + c4 * 4);
+            *reinterpret_cast<float4*>(C + (size_t) r * N + n0 + c4 * 4) = make_float4(v.x * f, v.y * f, v.z * f, v.w * f);
+        }
+        __syncthreads();
     }
 }
 
