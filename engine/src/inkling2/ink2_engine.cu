@@ -281,6 +281,11 @@ __device__ __forceinline__ float2 e2m1x2(uint32_t byte) {
     const uint32_t h = ((a & 0x00080008u) << 12) | ((a & 0x00070007u) << 9);
     return __half22float2(*reinterpret_cast<const __half2*>(&h));
 }
+// the same pair as fp16 bits (half2: e2m1 * 2^-14, exact, subnormal 0.5 included), no float conversion
+__device__ __forceinline__ uint32_t e2m1x2_h(uint32_t byte) {
+    const uint32_t a = (byte & 0xFu) | ((byte & 0xF0u) << 12);
+    return ((a & 0x00080008u) << 12) | ((a & 0x00070007u) << 9);
+}
 // two e4m3 bytes (in bits 0-7 and 16-23) -> fp32 values * 2^-8 (fp16 placement, exact incl. subnormals)
 __device__ __forceinline__ float2 e4m3x2(uint32_t a) {
     const uint32_t h = ((a & 0x00800080u) << 8) | ((a & 0x007F007Fu) << 7);
@@ -1367,14 +1372,17 @@ __global__ void __launch_bounds__(256) k_moe_mma_grp(const float* __restrict__ A
                                                      const int* __restrict__ ntiles, const int* __restrict__ eoff,
                                                      const int* __restrict__ ecnt, float* __restrict__ C, int N, int K) {
     __shared__ float red[8][32][8 + 1];
-    __shared__ float e4[256];
+    __shared__ uint32_t e4h[256];   // e4m3 scale as a half2 pair (exact in fp16, 448 max, 2^-9 min)
     if ((int) blockIdx.y >= *ntiles) return;
     const int e = tile_e[blockIdx.y], r0 = tile_r0[blockIdx.y], nr = min(eoff[e] + ecnt[e] - r0, SMALL_T);
     const uint8_t* Wt = tab[e];
     if (!Wt) return;   // computed on the CPU (--cpu-threads)
     const int row_base = blockIdx.x * 32;
     if (row_base >= N) return;
-    for (int i = threadIdx.x; i < 256; i += blockDim.x) e4[i] = e4m3_decode(i) * 16384.0f;
+    for (int i = threadIdx.x; i < 256; i += blockDim.x) {
+        const __half2 hh = __float2half2_rn(e4m3_decode(i));
+        e4h[i] = *reinterpret_cast<const uint32_t*>(&hh);
+    }
     __syncthreads();
     const int lane = threadIdx.x & 31, w = threadIdx.x >> 5, g = lane >> 2, q = lane & 3;
     const uint8_t* S = Wt + (size_t) N * (K / 2);
@@ -1410,15 +1418,17 @@ __global__ void __launch_bounds__(256) k_moe_mma_grp(const float* __restrict__ A
         }
 #pragma unroll
         for (int i = 0; i < 2; ++i) {   // m-tile: rows g (r = 2i) and g + 8 (r = 2i + 1)
-            const float s0 = e4[sc[2 * i]], s1 = e4[sc[2 * i + 1]];
+            const uint32_t s0 = e4h[sc[2 * i]], s1 = e4h[sc[2 * i + 1]];
             const uint32_t u0[2] = {wv[2 * i].x, wv[2 * i].y}, u1[2] = {wv[2 * i + 1].x, wv[2 * i + 1].y};
             float c0 = acc[4 * i], c1 = acc[4 * i + 1], c2 = acc[4 * i + 2], c3 = acc[4 * i + 3];
 #pragma unroll
             for (int j = 0; j < 8; ++j) {   // byte j of the 8: columns (2j, 2j + 1) of the lane's 16
                 const uint32_t by0 = (u0[j >> 2] >> (8 * (j & 3))) & 0xffu, by1 = (u1[j >> 2] >> (8 * (j & 3))) & 0xffu;
-                const float2 p0 = e2m1x2(by0), p1 = e2m1x2(by1);
-                __half2 h0 = __floats2half2_rn(p0.x * s0, p0.y * s0), h1 = __floats2half2_rn(p1.x * s1, p1.y * s1);
-                mma_m16n8k8(c0, c1, c2, c3, *reinterpret_cast<uint32_t*>(&h0), *reinterpret_cast<uint32_t*>(&h1), b[j]);
+                // value * 2^-14 times the scale, in fp16: exact (every product is a multiple of 2^-24); the 2^14 comes back at the end
+                const uint32_t p0 = e2m1x2_h(by0), p1 = e2m1x2_h(by1);
+                const __half2 h0 = __hmul2(*reinterpret_cast<const __half2*>(&p0), *reinterpret_cast<const __half2*>(&s0));
+                const __half2 h1 = __hmul2(*reinterpret_cast<const __half2*>(&p1), *reinterpret_cast<const __half2*>(&s1));
+                mma_m16n8k8(c0, c1, c2, c3, *reinterpret_cast<const uint32_t*>(&h0), *reinterpret_cast<const uint32_t*>(&h1), b[j]);
             }
             acc[4 * i] = c0; acc[4 * i + 1] = c1; acc[4 * i + 2] = c2; acc[4 * i + 3] = c3;
         }
@@ -1433,7 +1443,7 @@ __global__ void __launch_bounds__(256) k_moe_mma_grp(const float* __restrict__ A
         for (int ww = 0; ww < 8; ++ww) sum += red[ww][l][el8];
         const int gg = l >> 2, qq = l & 3, i = el8 >> 2, el = el8 & 3;
         const int row = row_base + i * 16 + gg + (el >> 1) * 8, tok = 2 * qq + (el & 1);
-        if (row < N && tok < nr) C[(size_t) (r0 + tok) * N + row] = sum * factors[e];
+        if (row < N && tok < nr) C[(size_t) (r0 + tok) * N + row] = (sum * 16384.0f) * factors[e];
     }
 }
 
