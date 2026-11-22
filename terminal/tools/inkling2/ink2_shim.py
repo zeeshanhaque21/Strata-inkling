@@ -21,7 +21,10 @@ class Engine:
         self.p = subprocess.Popen([a.engine, "--serve", "--model", a.model, "--max-context", str(a.ctx), "--chunk",
                                    str(a.chunk), "--tc", str(a.tc)] + shlex.split(a.engine_args), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                   stderr=open(a.log, "a"), text=True, bufsize=1)
-        line = self.p.stdout.readline().split()
+        while True:   # the engine may print INFO <key>=<value> lines (images=1, ...) before READY
+            line = self.p.stdout.readline().split()
+            if not line or line[0] != "INFO":
+                break
         assert line and line[0] == "READY", f"engine did not start: {line}"
         self.ctx = int(line[1])
         self.lock = threading.Lock()
