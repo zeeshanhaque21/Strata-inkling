@@ -1224,6 +1224,65 @@ __global__ void __launch_bounds__(256) kb_moe_gemm(const float* __restrict__ A, 
 // the same operations in the same order as the decode GEMVs (gemv_bf16_dot, k_gemv_nvfp4_sel, k_gemv_mxfp8_sel: a
 // lane walks words lane, lane + 32, ...), so a verified token's products match its decode products bit for bit.
 constexpr int SMALL_T = 8;
+// T <= SMALL_T vectors against the same int8 rows (speculative verification): per (row, token) the operations of gemv_q8_dot in
+// the same order, so a verified token's logits match its decode logits bit for bit.  X rows are read from global (L1 / L2).
+template <int R>
+__global__ void __launch_bounds__(256) k_gemv_q8_multi(const int8_t* __restrict__ W, const uint16_t* __restrict__ S,
+                                                       const float* __restrict__ X, int ldx, float* __restrict__ Y, int ldy,
+                                                       int N, int K, int T) {
+    constexpr int TV = SMALL_T;
+    const int lane = threadIdx.x & 31, row0 = (blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32) * R;
+    if (row0 >= N) return;
+    const uint4* w[R];
+    const uint16_t* sc[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        const size_t row = min(row0 + r, N - 1);
+        w[r] = reinterpret_cast<const uint4*>(W + row * K);
+        sc[r] = S + row * (K / 32);
+    }
+    float acc[R][TV];
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int t = 0; t < TV; ++t) acc[r][t] = 0.0f;
+#pragma unroll 2
+    for (int i = lane; i < K / 16; i += 32) {
+        uint4 v[R];
+        uint16_t sv[R];
+#pragma unroll
+        for (int r = 0; r < R; ++r) { v[r] = __ldg(w[r] + i); sv[r] = __ldg(sc[r] + (i >> 1)); }
+#pragma unroll
+        for (int t = 0; t < TV; ++t) {
+            if (t >= T) break;
+            const float4* x4 = reinterpret_cast<const float4*>(X + (size_t) t * ldx);
+            const float4 a0 = __ldg(x4 + 4 * i), a1 = __ldg(x4 + 4 * i + 1), a2 = __ldg(x4 + 4 * i + 2), a3 = __ldg(x4 + 4 * i + 3);
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                float d = s8(v[r].x, 0) * a0.x + s8(v[r].x, 1) * a0.y + s8(v[r].x, 2) * a0.z + s8(v[r].x, 3) * a0.w +
+                          s8(v[r].y, 0) * a1.x + s8(v[r].y, 1) * a1.y + s8(v[r].y, 2) * a1.z + s8(v[r].y, 3) * a1.w +
+                          s8(v[r].z, 0) * a2.x + s8(v[r].z, 1) * a2.y + s8(v[r].z, 2) * a2.z + s8(v[r].z, 3) * a2.w +
+                          s8(v[r].w, 0) * a3.x + s8(v[r].w, 1) * a3.y + s8(v[r].w, 2) * a3.z + s8(v[r].w, 3) * a3.w;
+                acc[r][t] += d * __uint_as_float((uint32_t) sv[r] << 16);
+            }
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < TV; ++t) {
+        if (t >= T) break;
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const float x = warp_sum(acc[r][t]);
+            if (!lane && row0 + r < N) Y[(size_t) t * ldy + row0 + r] = x;
+        }
+    }
+}
+// int8 rows -> fp32 (logit dumps through cuBLAS, T > SMALL_T)
+__global__ void kb_q8_to_f32(const int8_t* __restrict__ Q, const uint16_t* __restrict__ S, float* __restrict__ dst, size_t n) {
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = (float) Q[i] * __uint_as_float((uint32_t) S[i / 32] << 16);
+}
+
 // dense: Y[t][row] (row stride ldy) = W[row] . X[t] (row stride ldx), t < T <= SMALL_T; R rows per warp.  The T input
 // rows are read straight from global memory (L1 / L2: T x K x 4 B <= 147 KB, reused by every warp of an SM): no
 // shared-memory staging, no barrier, the weight loads of consecutive words pipelined (unroll 2).
@@ -1940,7 +1999,7 @@ void* upload(const void* p, size_t bytes) {
 float* dvec(const vec& v) { return (float*) upload(v.data(), v.size() * 4); }
 
 struct DMat { const uint16_t* d = nullptr; int n = 0, k = 0; const int8_t* q = nullptr; const uint16_t* s = nullptr; };   // q / s: INK2_Q8 copy
-static const int g_q8 = std::getenv("INK2_Q8") ? std::atoi(std::getenv("INK2_Q8")) : 0;   // bit mask: 1 unembed, 2 wo, 4 proj (q/k/v and the small rows stacked with them)
+static const int g_q8 = std::getenv("INK2_Q8") ? std::atoi(std::getenv("INK2_Q8")) : 1;   // int8 weights, bit mask (default 1; 0 = all BF16): 1 unembed, 2 wo, 4 proj (q/k/v and the small rows stacked with them)
 
 // Experts live in fixed-size slots of a device pool (one pool per format), each slot one expert as
 // [w13 | w13 scales | w2 | w2 scales] (part A = w13 + scales, part B = w2 + scales).  The kernels address an expert
@@ -3162,6 +3221,11 @@ const float* wf32(const DMat& W, int first = 0, int n = -1) {
     if (n < 0) n = W.n - first;
     const size_t n8 = (size_t) n * W.k / 8;
     if ((size_t) n * W.k > PF.wf_cap) { std::fprintf(stderr, "wf32: %d x %d over the scratch\n", n, W.k); std::exit(1); }
+    if (W.q) {
+        const size_t cnt = (size_t) n * W.k;
+        kb_q8_to_f32<<<(unsigned) ((cnt + 255) / 256), 256>>>(W.q + (size_t) first * W.k, W.s + (size_t) first * (W.k / 32), PF.wf, cnt);
+        return PF.wf;
+    }
     kb_bf16_to_f32<<<(unsigned) ((n8 + 255) / 256), 256>>>(W.d + (size_t) first * W.k, PF.wf, n8);
     return PF.wf;
 }
@@ -3175,6 +3239,19 @@ void sgemm(const float* Wf, int n, int K, const float* X, int ldx, float* Y, int
 }
 // rows [first, first + n) of W, T <= SMALL_T vectors
 void gemv_multi(const DMat& W, int first, int n, const float* X, int ldx, float* Y, int ldy, int T) {
+    if (W.q) {   // int8 rows (the unembedding: n >> 256, K % 32 == 0)
+        int R = 4;
+        while (R > 1 && (n + 8 * R - 1) / (8 * R) < g_gemv_min_blocks) R /= 2;
+        const unsigned g = (unsigned) ((n + 8 * R - 1) / (8 * R));
+        const int8_t* q = W.q + (size_t) first * W.k;
+        const uint16_t* sc = W.s + (size_t) first * (W.k / 32);
+        switch (R) {
+        case 1: k_gemv_q8_multi<1><<<g, 256>>>(q, sc, X, ldx, Y, ldy, n, W.k, T); break;
+        case 2: k_gemv_q8_multi<2><<<g, 256>>>(q, sc, X, ldx, Y, ldy, n, W.k, T); break;
+        default: k_gemv_q8_multi<4><<<g, 256>>>(q, sc, X, ldx, Y, ldy, n, W.k, T);
+        }
+        return;
+    }
     if (W.k == 64) {
         k_gemv_bf16_multi_k64<<<(unsigned) ((n + 31) / 32), 256>>>(W.d + (size_t) first * 64, X, ldx, Y, ldy, n, T);
         return;
@@ -4138,6 +4215,11 @@ int main(int argc, char** argv) {
         PF.am = (int*) dalloc(DBLK * 4);
         CK(cudaHostAlloc((void**) &PF.rows_host, (size_t) DBLK * VOCAB * 4, cudaHostAllocDefault));
         g_fring = dfloats((size_t) FRING * 4 * H);
+    }
+    if (E.unembed.q && E.unembed.d && !std::getenv("INK2_KEEP_BF16")) {   // the drafter's fold above was the last reader of the BF16 copy
+        CK(cudaFree(const_cast<uint16_t*>(E.unembed.d)));
+        g_vram -= (size_t) E.unembed.n * E.unembed.k * 2;
+        E.unembed.d = nullptr;
     }
     if (E.offload) setup_offload();
     if (E.cpu) setup_cpu();
