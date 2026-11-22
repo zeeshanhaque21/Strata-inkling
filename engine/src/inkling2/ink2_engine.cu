@@ -178,6 +178,84 @@ __global__ void k_gemv_bf16_qkv(const uint16_t* __restrict__ W, const float* __r
     gemv_bf16_dot<R>(W, xs + (row0 < b1 ? 0 : row0 < b2 ? K : 2 * K), y, N, K, row0);
 }
 
+// ---- int8 dense weights (INK2_Q8=1): W [N, K] as int8 with one bf16 scale per 32 columns (Q8_0's precision class).  A lane reads 16
+// columns (16 B) per load; the dense BF16 projections are ~70 % of the bytes a decode step streams, int8 halves them.
+__device__ __forceinline__ int s8(uint32_t u, int j) { return (int) (int8_t) (u >> (8 * j)); }
+template <int R>
+__device__ __forceinline__ void gemv_q8_dot(const int8_t* __restrict__ W, const uint16_t* __restrict__ S, const float* xs,
+                                            float* __restrict__ y, int N, int K, int row0) {
+    const int lane = threadIdx.x & 31;
+    const uint4* w[R];
+    const uint16_t* sc[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        const size_t row = min(row0 + r, N - 1);
+        w[r] = reinterpret_cast<const uint4*>(W + row * K);
+        sc[r] = S + row * (K / 32);
+    }
+    const float4* x4 = reinterpret_cast<const float4*>(xs);
+    float acc[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) acc[r] = 0.0f;
+#pragma unroll 2
+    for (int i = lane; i < K / 16; i += 32) {
+        uint4 v[R];
+        uint16_t sv[R];
+#pragma unroll
+        for (int r = 0; r < R; ++r) { v[r] = __ldg(w[r] + i); sv[r] = __ldg(sc[r] + (i >> 1)); }
+        const float4 a0 = x4[4 * i], a1 = x4[4 * i + 1], a2 = x4[4 * i + 2], a3 = x4[4 * i + 3];
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            float d = s8(v[r].x, 0) * a0.x + s8(v[r].x, 1) * a0.y + s8(v[r].x, 2) * a0.z + s8(v[r].x, 3) * a0.w +
+                      s8(v[r].y, 0) * a1.x + s8(v[r].y, 1) * a1.y + s8(v[r].y, 2) * a1.z + s8(v[r].y, 3) * a1.w +
+                      s8(v[r].z, 0) * a2.x + s8(v[r].z, 1) * a2.y + s8(v[r].z, 2) * a2.z + s8(v[r].z, 3) * a2.w +
+                      s8(v[r].w, 0) * a3.x + s8(v[r].w, 1) * a3.y + s8(v[r].w, 2) * a3.z + s8(v[r].w, 3) * a3.w;
+            acc[r] += d * __uint_as_float((uint32_t) sv[r] << 16);
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        const float t = warp_sum(acc[r]);
+        if (!lane && row0 + r < N) y[row0 + r] = t;
+    }
+}
+template <int R>
+__global__ void k_gemv_q8(const int8_t* __restrict__ W, const uint16_t* __restrict__ S, const float* __restrict__ x,
+                          float* __restrict__ y, int N, int K) {
+    extern __shared__ float xs[];
+    for (int i = threadIdx.x; i < K; i += blockDim.x) xs[i] = x[i];
+    __syncthreads();
+    const int row0 = (blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32) * R;
+    if (row0 >= N) return;
+    gemv_q8_dot<R>(W, S, xs, y, N, K, row0);
+}
+template <int R>
+__global__ void k_gemv_q8_qkv(const int8_t* __restrict__ W, const uint16_t* __restrict__ S, const float* __restrict__ xq,
+                              const float* __restrict__ xk, const float* __restrict__ xv, int b1, int b2, float* __restrict__ y,
+                              int N, int K) {
+    extern __shared__ float xs[];
+    const int rb = blockIdx.x * (blockDim.x / 32) * R, re = min(rb + (int) (blockDim.x / 32) * R, N);
+    if (rb < b1) for (int i = threadIdx.x; i < K; i += blockDim.x) xs[i] = xq[i];
+    if (rb < b2 && re > b1) for (int i = threadIdx.x; i < K; i += blockDim.x) xs[K + i] = xk[i];
+    if (re > b2) for (int i = threadIdx.x; i < K; i += blockDim.x) xs[2 * K + i] = xv[i];
+    __syncthreads();
+    const int row0 = (blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32) * R;
+    if (row0 >= N) return;
+    gemv_q8_dot<R>(W, S, xs + (row0 < b1 ? 0 : row0 < b2 ? K : 2 * K), y, N, K, row0);
+}
+// quantize: one thread per (row, 32-column block); scale = bf16(amax / 127), q = round(w / scale)
+__global__ void kb_quant_q8(const uint16_t* __restrict__ W, int8_t* __restrict__ Q, uint16_t* __restrict__ S, size_t nblk) {
+    const size_t b = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= nblk) return;
+    float v[32], amax = 0.0f;
+    for (int j = 0; j < 32; ++j) { v[j] = __uint_as_float((uint32_t) W[b * 32 + j] << 16); amax = fmaxf(amax, fabsf(v[j])); }
+    uint32_t sb = __float_as_uint(amax / 127.0f);
+    sb = (sb + 0x7FFFu + ((sb >> 16) & 1u)) >> 16;                  // round to nearest even bf16
+    const float sf = __uint_as_float(sb << 16), inv = sf > 0.0f ? 1.0f / sf : 0.0f;
+    S[b] = (uint16_t) sb;
+    for (int j = 0; j < 32; ++j) Q[b * 32 + j] = (int8_t) max(-127, min(127, __float2int_rn(v[j] * inv)));
+}
+
 // Up to 3 independent message gates per launch (gate j = blockIdx.y, or blockIdx.x for the one-block kernels): the
 // q / k / v gates of a layer application are independent, 4 launches instead of 12; same arithmetic per gate.
 struct GateArgs {
@@ -1850,7 +1928,8 @@ void* upload(const void* p, size_t bytes) {
 }
 float* dvec(const vec& v) { return (float*) upload(v.data(), v.size() * 4); }
 
-struct DMat { const uint16_t* d = nullptr; int n = 0, k = 0; };
+struct DMat { const uint16_t* d = nullptr; int n = 0, k = 0; const int8_t* q = nullptr; const uint16_t* s = nullptr; };   // q / s: INK2_Q8 copy
+static const bool g_q8 = std::getenv("INK2_Q8") != nullptr && std::atoi(std::getenv("INK2_Q8")) != 0;
 
 // Experts live in fixed-size slots of a device pool (one pool per format), each slot one expert as
 // [w13 | w13 scales | w2 | w2 scales] (part A = w13 + scales, part B = w2 + scales).  The kernels address an expert
@@ -2010,6 +2089,19 @@ DMat dmat_stack(const std::vector<std::string>& names) {   // BF16 matrices with
     return m;
 }
 
+// INK2_Q8=1: an int8 copy of a dense BF16 matrix for the decode GEMVs (the BF16 copy stays for the prefill / spec paths for now)
+void quantize_q8(DMat& m) {
+    if (!g_q8) return;
+    if (m.k % 32) { std::fprintf(stderr, "q8: K %d not a multiple of 32\n", m.k); std::exit(1); }
+    const size_t nblk = (size_t) m.n * m.k / 32;
+    int8_t* q = (int8_t*) dalloc(nblk * 32);
+    uint16_t* sc = (uint16_t*) dalloc(nblk * 2);
+    kb_quant_q8<<<(unsigned) ((nblk + 255) / 256), 256>>>(m.d, q, sc, nblk);
+    CK(cudaDeviceSynchronize());
+    m.q = q;
+    m.s = sc;
+}
+
 // the NUMA node of the GPU (sysfs), -1 when unknown
 int gpu_node() {
     char bus[32] = {0};
@@ -2036,6 +2128,7 @@ void load() {
         std::memcpy(E.embed.data(), b.data(), b.size());
     }
     E.unembed = dmat(p + "unembed.weight");
+    quantize_q8(E.unembed);
     {
         const vec q = ck.f32(p + "middle_cycle_cross_pass_queries"), kv = ck.f32(p + "middle_cycle_cross_pass_kv_queries");
         vec mq((size_t) NLOOP * 4 * H);
@@ -2106,6 +2199,8 @@ void load() {
             if (Y.proj.n != Y.off_v + Y.n_v) { std::fprintf(stderr, "layer %d: stacked rows %d\n", l, Y.proj.n); std::exit(1); }
         }
         Y.wo = dmat(q + "attn.wo_ud.weight");
+        quantize_q8(Y.wo);
+        quantize_q8(Y.proj);
         Y.router = dmat(q + "mlp.gate.weight");
         Y.router_bias = fvec(q + "mlp.gate.bias");
         Y.q_scale = fvec(q + "attn.q_l2_clip.scale");
@@ -2289,6 +2384,17 @@ void gemv(const DMat& W, const float* x, float* y, int rows = -1, int first = 0)
     while (R > 1 && (n + 8 * R - 1) / (8 * R) < g_gemv_min_blocks) R /= 2;
     const unsigned g = (unsigned) ((n + 8 * R - 1) / (8 * R));
     const size_t sm = (size_t) W.k * 4;
+    if (W.q) {
+        const int8_t* q = W.q + (size_t) first * W.k;
+        const uint16_t* sc = W.s + (size_t) first * (W.k / 32);
+        switch (R) {
+        case 1: k_gemv_q8<1><<<g, 256, sm>>>(q, sc, x, y, n, W.k); break;
+        case 2: k_gemv_q8<2><<<g, 256, sm>>>(q, sc, x, y, n, W.k); break;
+        case 8: k_gemv_q8<8><<<g, 256, sm>>>(q, sc, x, y, n, W.k); break;
+        default: k_gemv_q8<4><<<g, 256, sm>>>(q, sc, x, y, n, W.k);
+        }
+        return;
+    }
     const uint16_t* w = W.d + (size_t) first * W.k;
     switch (R) {
     case 1: k_gemv_bf16<1><<<g, 256, sm>>>(w, x, y, n, W.k); break;
@@ -2348,6 +2454,15 @@ void attention(const Layer& Y, Slot& S, const float* xq, const float* xk, const 
         while (R > 1 && ((N + 8 * R - 1) / (8 * R) < g_gemv_min_blocks || Y.off_k % R || Y.off_v % R)) R /= 2;
         const unsigned g = (unsigned) ((N + 8 * R - 1) / (8 * R));
         const size_t sm = (size_t) 3 * K * 4;
+        if (Y.proj.q) {
+            const DMat& P_ = Y.proj;
+            switch (R) {
+            case 1: k_gemv_q8_qkv<1><<<g, 256, sm>>>(P_.q, P_.s, xq, xk, xv, Y.off_k, Y.off_v, P, N, K); break;
+            case 2: k_gemv_q8_qkv<2><<<g, 256, sm>>>(P_.q, P_.s, xq, xk, xv, Y.off_k, Y.off_v, P, N, K); break;
+            case 8: k_gemv_q8_qkv<8><<<g, 256, sm>>>(P_.q, P_.s, xq, xk, xv, Y.off_k, Y.off_v, P, N, K); break;
+            default: k_gemv_q8_qkv<4><<<g, 256, sm>>>(P_.q, P_.s, xq, xk, xv, Y.off_k, Y.off_v, P, N, K);
+            }
+        } else
         switch (R) {
         case 1: k_gemv_bf16_qkv<1><<<g, 256, sm>>>(Y.proj.d, xq, xk, xv, Y.off_k, Y.off_v, P, N, K); break;
         case 2: k_gemv_bf16_qkv<2><<<g, 256, sm>>>(Y.proj.d, xq, xk, xv, Y.off_k, Y.off_v, P, N, K); break;
