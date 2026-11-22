@@ -1277,6 +1277,11 @@ __global__ void __launch_bounds__(256) k_gemv_q8_multi(const int8_t* __restrict_
         }
     }
 }
+// int8 rows -> fp16 (prefill: the cuBLAS half GEMM reads the dequantized matrix from PF.wh)
+__global__ void kb_q8_to_f16(const int8_t* __restrict__ Q, const uint16_t* __restrict__ S, half* __restrict__ dst, size_t n) {
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = __float2half_rn((float) Q[i] * __uint_as_float((uint32_t) S[i / 32] << 16));
+}
 // int8 rows -> fp32 (logit dumps through cuBLAS, T > SMALL_T)
 __global__ void kb_q8_to_f32(const int8_t* __restrict__ Q, const uint16_t* __restrict__ S, float* __restrict__ dst, size_t n) {
     const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -2160,7 +2165,7 @@ DMat dmat_stack(const std::vector<std::string>& names) {   // BF16 matrices with
 }
 
 // INK2_Q8=1: an int8 copy of a dense BF16 matrix for the decode GEMVs (the BF16 copy stays for the prefill / spec paths for now)
-void quantize_q8(DMat& m, int bit, int layer = -1) {
+void quantize_q8(DMat& m, int bit, int layer = -1, bool drop_bf16 = false) {
     if (!(g_q8 & bit)) return;
     if (layer >= 0 && std::getenv("INK2_Q8_L")) {   // INK2_Q8_L=a,b: only layers a..b (diagnostics)
         int a = 0, b = 99;
@@ -2195,6 +2200,11 @@ void quantize_q8(DMat& m, int bit, int layer = -1) {
             for (int i = 0; i < m.n; ++i) { num += (double) (a_[i] - b_[i]) * (a_[i] - b_[i]); den += (double) a_[i] * a_[i]; mx = std::max(mx, (double) std::fabs(a_[i] - b_[i])); }
             std::fprintf(stderr, "q8check n=%d k=%d R=%d: rel err %.3e (max abs %.3e, rms ref %.3e)\n", m.n, m.k, R, std::sqrt(num / std::max(den, 1e-30)), mx, std::sqrt(den / m.n));
         }
+    }
+    if (m.q && drop_bf16) {   // no BF16 reader is left for this matrix (decode, verify, prefill and the fp32 path all have int8 branches)
+        CK(cudaFree(const_cast<uint16_t*>(m.d)));
+        g_vram -= (size_t) m.n * m.k * 2;
+        m.d = nullptr;
     }
 }
 
@@ -2295,8 +2305,8 @@ void load() {
             if (Y.proj.n != Y.off_v + Y.n_v) { std::fprintf(stderr, "layer %d: stacked rows %d\n", l, Y.proj.n); std::exit(1); }
         }
         Y.wo = dmat(q + "attn.wo_ud.weight");
-        quantize_q8(Y.wo, 2, l);
-        quantize_q8(Y.proj, 4, l);
+        quantize_q8(Y.wo, 2, l, true);
+        quantize_q8(Y.proj, 4, l, true);
         Y.router = dmat(q + "mlp.gate.weight");
         Y.router_bias = fvec(q + "mlp.gate.bias");
         Y.q_scale = fvec(q + "attn.q_l2_clip.scale");
@@ -3203,7 +3213,8 @@ void hgemm(const DMat& W, bool wcvt, int first, int n, const float* X, int ldx, 
     if (T <= SMALL_T) { gemv_multi(W, first, n, X, ldx, Y, ldy, T); return; }
     if (wcvt) {
         const size_t nw = (size_t) W.n * W.k;
-        kb_bf16_to_f16<<<(unsigned) ((nw + 255) / 256), 256>>>(W.d, PF.wh, nw);
+        if (W.q) kb_q8_to_f16<<<(unsigned) ((nw + 255) / 256), 256>>>(W.q, W.s, PF.wh, nw);
+        else kb_bf16_to_f16<<<(unsigned) ((nw + 255) / 256), 256>>>(W.d, PF.wh, nw);
     }
     half* xh = PF.xh + (size_t) xslot * PF.TP * QD;
     const size_t nx = (size_t) T * K;

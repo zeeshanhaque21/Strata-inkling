@@ -1,7 +1,8 @@
 #!/bin/bash
 # ink2-serve start|stop|status|logs: Inkling-2-Mini on the Strata engine, one engine per GPU behind a pool, as systemd user services.
 # Defaults: 2 GPUs, 128K context per stream, int8 KV, DSpark drafter (--spec 1), 4 client streams (2 run at once, 2 wait), port 8080 on localhost.
-# Override with env: GPUS="0 1" CTX=131072 KV=i8 RESERVE=1500 SPEC=1 PORT=8080 HOST=127.0.0.1 MODEL=... ENGINE=... SHIM_PY=...
+# Override with env: GPUS="0 1" CTX=131072 KV=i8 RESERVE=1500 SPEC=1 PORT=8080 HOST=127.0.0.1 MODEL=... ENGINE=... Q8=1
+# Q8: int8 dense weights, bit mask: 1 = unembedding (default, no measurable quality cost), 7 = also wo and q/k/v (faster, see docs), 0 = all BF16
 set -u
 GPUS=${GPUS:-"0 1"}; CTX=${CTX:-131072}; KV=${KV:-i8}; RESERVE=${RESERVE:-1500}; SPEC=${SPEC:-1}; PORT=${PORT:-8080}; HOST=${HOST:-127.0.0.1}
 MODEL=${MODEL:-/mnt/models/inkling-official}
@@ -17,7 +18,7 @@ case "${1:-status}" in
       p=$((8101 + i)); i=$((i + 1)); backends+=(--backend "http://127.0.0.1:$p")
       systemctl --user reset-failed "$(unit $g)" 2>/dev/null
       systemd-run --user --unit="$(unit $g)" --collect -p Restart=on-failure -p RestartSec=10 \
-        -E CUDA_VISIBLE_DEVICES="$g" -E LD_LIBRARY_PATH=/opt/cuda/lib64 \
+        -E CUDA_VISIBLE_DEVICES="$g" -E LD_LIBRARY_PATH=/opt/cuda/lib64 -E INK2_Q8="${Q8:-1}" \
         -p StandardOutput=append:"$LOGDIR/gpu$g.out" -p StandardError=append:"$LOGDIR/gpu$g.out" \
         "$PY" "$HERE/ink2_shim.py" --engine "$ENGINE" --model "$MODEL" --host 127.0.0.1 --port "$p" --ctx "$CTX" --chunk 512 --tc 1 \
         --log "$LOGDIR/engine-gpu$g.log" --engine-args "--kv $KV --vram-reserve-mib $RESERVE --spec $SPEC" >/dev/null
