@@ -4,7 +4,7 @@
 # Override with env: GPUS="0 1" CTX=131072 KV=i8 RESERVE=1500 SPEC=1 PORT=8080 HOST=127.0.0.1 MODEL=... ENGINE=... Q8=1
 # Q8: int8 dense weights, bit mask: 1 = unembedding (default, no measurable quality cost), 7 = also wo and q/k/v (faster, see docs), 0 = all BF16
 set -u
-GPUS=${GPUS:-"0 1"}; CTX=${CTX:-131072}; KV=${KV:-i8}; RESERVE=${RESERVE:-1500}; SPEC=${SPEC:-1}; PORT=${PORT:-8080}; HOST=${HOST:-127.0.0.1}
+GPUS=${GPUS:-"0 1"}; CTX=${CTX:-131072}; KV=${KV:-i8}; RESERVE=${RESERVE:-800}; SPEC=${SPEC:-1}; PORT=${PORT:-8080}; HOST=${HOST:-127.0.0.1}
 CHUNK=${CHUNK:-1024}   # prefill chunk: 1024 reads prompts 41 % faster than 512 at 128K context; 2048 is +66 % but costs 12 % decode speed (smaller expert cache)
 MODEL=${MODEL:-/mnt/models/inkling-official}
 HERE=$(cd "$(dirname "$0")" && pwd)
