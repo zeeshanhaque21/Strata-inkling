@@ -2192,7 +2192,9 @@ __global__ void kb_bf16_to_f16(const uint16_t* __restrict__ src, half* __restric
 // (store_matrix_sync of known values: the element -> row mapping is not specified by the API, so it is measured).
 constexpr int AQ = 64, AK = 32, ALD = HD + 8, SLD = AK + 4, PLD = AK + 8, AW = 4 * NREP;
 static_assert(16 * PLD * 2 <= 16 * SLD * 4, "P aliases S");
-__global__ void __launch_bounds__(128 * NREP, 1) kb_attn_tc(const half* __restrict__ qh, const float* __restrict__ P, int sp,
+// TQW: 16-row query warps per head: 4 (64 query rows, prompt chunks) or 1 (<= 16 rows: the verify block, T = 8: 3x fewer idle warps)
+template <int TQW>
+__global__ void __launch_bounds__(32 * NREP * TQW, TQW == 1 ? 3 : 1) kb_attn_tc(const half* __restrict__ qh, const float* __restrict__ P, int sp,
                                                   const void* __restrict__ K, const void* __restrict__ V,
                                                   const __half* __restrict__ ksc, const __half* __restrict__ vsc,
                                                   const float* __restrict__ rel, int cap, int window, int pos0, int T,
@@ -2204,15 +2206,16 @@ __global__ void __launch_bounds__(128 * NREP, 1) kb_attn_tc(const half* __restri
     // GQA group per block: the NREP q heads of kv head g share each K / V tile (loaded and converted once);
     // warp w: head g * NREP + w / 4, query rows t0 + (w % 4) * 16.  Per warp the computation is unchanged.
     // P (fp16) overwrites the warp's own S rows once read; the row map lives in the K / V tile before the loop.
+    constexpr int AWT = NREP * TQW, NTH = 32 * AWT, QROWS = 16 * TQW;
     __shared__ __align__(32) half KVs[2 * AK * ALD];
-    __shared__ __align__(32) float Ss[AW][16 * SLD];
-    __shared__ float ms[AW][16], ls[AW][16], fs[AW][16];
-    static_assert(AW * 256 * 4 <= 2 * AK * ALD * 2, "row map fits in the K / V tile");
+    __shared__ __align__(32) float Ss[AWT][16 * SLD];
+    __shared__ float ms[AWT][16], ls[AWT][16], fs[AWT][16];
+    static_assert(AWT * 256 * 4 <= 2 * AK * ALD * 2, "row map fits in the K / V tile");
     half* Ks = KVs;
     half* Vs = KVs + AK * ALD;
-    const int g = blockIdx.y, t0 = blockIdx.x * AQ, tid = threadIdx.x, w = tid / 32, lane = tid % 32;
-    const int h = g * NREP + w / 4;
-    const int tw = t0 + (w % 4) * 16;   // this warp's first query row
+    const int g = blockIdx.y, t0 = blockIdx.x * QROWS, tid = threadIdx.x, w = tid / 32, lane = tid % 32;
+    const int h = g * NREP + w / TQW;
+    const int tw = t0 + (w % TQW) * 16;   // this warp's first query row
     half* Pw = reinterpret_cast<half*>(Ss[w]);
     int* rmw = reinterpret_cast<int*>(KVs) + w * 256;
     using FA = wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major>;
@@ -2245,14 +2248,63 @@ __global__ void __launch_bounds__(128 * NREP, 1) kb_attn_tc(const half* __restri
         ls[w][lane] = split > 0 ? 0.0f : 1.0f;
     }
     const float scale = rsqrtf((float) HD);
-    const int nq = min(AQ, T - t0);
+    const int nq = min(QROWS, T - t0);
     const int pa = pos0 + t0, pb = pos0 + t0 + nq - 1;
     const int lo = window > 0 ? max(0, pa - window + 1) : 0;
     const int per = nsplit > 1 ? ((pb - lo + 1 + nsplit - 1) / nsplit + AK - 1) / AK * AK : pb - lo + 1;
     const int kb = lo + split * per, ke = min(pb, kb + per - 1);
+    // int8 K and V (--kv i8 / i8r / k8v8): the next tile's raw 16 B units are loaded into registers while this tile's
+    // MMAs run (the tile used to be loaded and used in the same step: 43 % of the stall samples sat on the first
+    // int8 -> float conversion, waiting for the load).  The conversion is q8 -> half by the exact byte trick and an
+    // fp16 multiply by the group scale: one rounding of an exact product, the same value as the float path.
+    const bool fast = c_kvm == 2 || c_kvm == 3 || c_kvm == 5;
+    constexpr int NU = (AK * HD / 16 + NTH - 1) / NTH;   // 16 B units of a tile, K and V alike
+    uint4 kr[NU], vr[NU];
+    __half ksr[NU], vsr[NU];
+    auto fetch = [&](int k0) {
+#pragma unroll
+        for (int u = 0; u < NU; ++u) {
+            const int unit = tid + u * NTH, r = unit / (HD / 16), dg = unit % (HD / 16), j = k0 + r;
+            kr[u] = make_uint4(0, 0, 0, 0); vr[u] = kr[u]; ksr[u] = __float2half(0.0f); vsr[u] = ksr[u];
+            if (unit < AK * HD / 16 && j <= pb) {
+                const size_t row = (size_t) (j % cap);
+                const int e = g * HD + dg * 16;
+                kr[u] = __ldg(reinterpret_cast<const uint4*>(static_cast<const int8_t*>(K) + row * KVD + e));
+                vr[u] = __ldg(reinterpret_cast<const uint4*>(static_cast<const int8_t*>(V) + row * KVD + e));
+                ksr[u] = ksc[row * (KVD / KVG) + e / KVG];
+                vsr[u] = vsc[row * (KVD / KVG) + e / KVG];
+            }
+        }
+    };
+    auto cvt16 = [](const uint4 raw, const __half sc, half* dst) {   // 16 int8 -> 16 halves (two 16 B stores)
+        const __half2 s2 = __half2half2(sc);
+        const uint32_t wd[4] = {raw.x ^ 0x80808080u, raw.y ^ 0x80808080u, raw.z ^ 0x80808080u, raw.w ^ 0x80808080u};
+        uint32_t o[8];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const uint32_t a = q8_pair_h2(wd[i], 0x4140), b = q8_pair_h2(wd[i], 0x4342);
+            const __half2 ha = __hmul2(*reinterpret_cast<const __half2*>(&a), s2), hb = __hmul2(*reinterpret_cast<const __half2*>(&b), s2);
+            o[2 * i] = *reinterpret_cast<const uint32_t*>(&ha);
+            o[2 * i + 1] = *reinterpret_cast<const uint32_t*>(&hb);
+        }
+        *reinterpret_cast<uint4*>(dst) = make_uint4(o[0], o[1], o[2], o[3]);
+        *reinterpret_cast<uint4*>(dst + 8) = make_uint4(o[4], o[5], o[6], o[7]);
+    };
+    if (fast) fetch(kb);
     for (int k0 = kb; k0 <= ke; k0 += AK) {
         __syncthreads();
-        for (int i = tid; i < AK * HD / 4; i += 128 * NREP) {   // float4 units
+        if (fast) {
+#pragma unroll
+            for (int u = 0; u < NU; ++u) {
+                const int unit = tid + u * NTH;
+                if (unit < AK * HD / 16) {
+                    const int r = unit / (HD / 16), dg = unit % (HD / 16);
+                    cvt16(kr[u], ksr[u], Ks + r * ALD + dg * 16);
+                    cvt16(vr[u], vsr[u], Vs + r * ALD + dg * 16);
+                }
+            }
+        } else {
+        for (int i = tid; i < AK * HD / 4; i += NTH) {   // float4 units
             const int r = i / (HD / 4), d = (i % (HD / 4)) * 4, j = k0 + r;
             float4 kv = make_float4(0, 0, 0, 0), vv = kv;
             if (j <= pb) {
@@ -2264,7 +2316,9 @@ __global__ void __launch_bounds__(128 * NREP, 1) kb_attn_tc(const half* __restri
             *reinterpret_cast<uint2*>(Ks + r * ALD + d) = *reinterpret_cast<uint2*>(a);
             *reinterpret_cast<uint2*>(Vs + r * ALD + d) = *reinterpret_cast<uint2*>(b);
         }
+        }
         __syncthreads();
+        if (fast && k0 + AK <= ke) fetch(k0 + AK);   // the next tile's loads fly during this tile's MMAs
         if (tw >= T) continue;   // whole warp past the chunk (still joins the block barriers)
         FC s[AK / 16];
 #pragma unroll
@@ -2773,6 +2827,7 @@ struct DMat {
 };
 // tensor-core / int8 switches (env: INK2_Q8 mask, INK2_MMA, INK2_MMA_MOE, INK2_MMA_PLAIN)
 static const int g_q8 = std::getenv("INK2_Q8") ? std::atoi(std::getenv("INK2_Q8")) : 1;   // int8 dense weights, bit mask (0 = all BF16): 1 unembed, 2 wo, 4 proj, 8 the drafter's dense weights
+static const bool g_attn16 = !(std::getenv("INK2_ATTN16") && std::atoi(std::getenv("INK2_ATTN16")) == 0);
 static const bool g_mma = !(std::getenv("INK2_MMA") && std::atoi(std::getenv("INK2_MMA")) == 0);
 static const bool g_mma_moe = !(std::getenv("INK2_MMA_MOE") && std::atoi(std::getenv("INK2_MMA_MOE")) == 0);
 static const bool g_mma_plain = !(std::getenv("INK2_MMA_PLAIN") && std::atoi(std::getenv("INK2_MMA_PLAIN")) == 0);
@@ -4815,7 +4870,11 @@ void attention_b(const Layer& Y, Slot& S, const float* xq, int sq, const float* 
             const int nk = pos0 < 0 ? (S.full ? E.ctx : WINDOW + T) : pos0 + T - (S.full ? 0 : std::max(0, pos0 - WINDOW + 1));
             ns = std::min(SPLIT_MAX, std::max(1, nk / SPLIT_KEYS));
         }
-        kb_attn_tc<<<dim3((T + AQ - 1) / AQ, NKV, ns), 128 * NREP>>>(PF.qh, P, np, S.K, S.V, S.ksc, S.vsc, PF.rel, S.cap,
+        if (T <= 16 && ns > 1 && g_attn16)
+            kb_attn_tc<1><<<dim3(1, NKV, ns), 32 * NREP>>>(PF.qh, P, np, S.K, S.V, S.ksc, S.vsc, PF.rel, S.cap, S.full ? 0 : WINDOW, pos0, T,
+                                                           PF.att, ns, PF.spm, PF.spl, PF.spo);
+        else
+            kb_attn_tc<4><<<dim3((T + AQ - 1) / AQ, NKV, ns), 128 * NREP>>>(PF.qh, P, np, S.K, S.V, S.ksc, S.vsc, PF.rel, S.cap,
                                                                  S.full ? 0 : WINDOW, pos0, T, PF.att, ns, PF.spm,
                                                                  PF.spl, PF.spo);
         if (ns > 1) kb_attn_merge_split<<<dim3(NQ, T), HD>>>(PF.spm, PF.spl, PF.spo, ns, PF.att);
