@@ -1355,6 +1355,88 @@ __global__ void __launch_bounds__(256) k_mma_q8_multi(const int8_t* __restrict__
     }
 }
 
+// ---- tensor-core grouped NVFP4 experts for T <= 8 (speculative verification): the tile's <= 8 token rows against one expert's weights.
+// Same operands as kb_moe_gemm_tc (weights exact in fp16: e2m1 x e4m3 scale folded in; activations rounded to fp16), one
+// mma.m16n8k8 = 16 weight rows x 8 tokens.  The 16-column NVFP4 scale is folded into the fp16 weights, so nothing is rescaled
+// after the MMAs and a lane can take 16 contiguous columns (8 B of a row, one scale byte): the 4 lanes of a row read one 32 B
+// sector.  k step j of a lane is its columns (16q + 2j, 16q + 2j + 1) in A and in B (consistent permutation).
+// Block = 8 warps on 32 weight rows, split K by 64-column rounds, reduced through shared memory.
+__global__ void __launch_bounds__(256) k_moe_mma_grp(const float* __restrict__ A, int lda, const int* __restrict__ rows,
+                                                     const uint8_t* const* __restrict__ tab, const float* __restrict__ factors,
+                                                     const int* __restrict__ tile_e, const int* __restrict__ tile_r0,
+                                                     const int* __restrict__ ntiles, const int* __restrict__ eoff,
+                                                     const int* __restrict__ ecnt, float* __restrict__ C, int N, int K) {
+    __shared__ float red[8][32][8 + 1];
+    __shared__ float e4[256];
+    if ((int) blockIdx.y >= *ntiles) return;
+    const int e = tile_e[blockIdx.y], r0 = tile_r0[blockIdx.y], nr = min(eoff[e] + ecnt[e] - r0, SMALL_T);
+    const uint8_t* Wt = tab[e];
+    if (!Wt) return;   // computed on the CPU (--cpu-threads)
+    const int row_base = blockIdx.x * 32;
+    if (row_base >= N) return;
+    for (int i = threadIdx.x; i < 256; i += blockDim.x) e4[i] = e4m3_decode(i) * 16384.0f;
+    __syncthreads();
+    const int lane = threadIdx.x & 31, w = threadIdx.x >> 5, g = lane >> 2, q = lane & 3;
+    const uint8_t* S = Wt + (size_t) N * (K / 2);
+    const uint2* wp[4];
+    const uint8_t* sp[4];
+#pragma unroll
+    for (int r = 0; r < 4; ++r) {
+        const int row = min(row_base + (r >> 1) * 16 + g + (r & 1) * 8, N - 1);
+        wp[r] = reinterpret_cast<const uint2*>(Wt + (size_t) row * (K / 2));
+        sp[r] = S + (size_t) row * (K / 16);
+    }
+    const bool xok = g < nr;
+    const float4* xp = reinterpret_cast<const float4*>(A + (size_t) (xok ? (rows ? rows[r0 + g] : r0 + g) : 0) * lda);
+    float acc[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) acc[i] = 0.0f;
+    const int nround = K / 64;
+#pragma unroll 2
+    for (int rd = w; rd < nround; rd += 8) {
+        uint2 wv[4];
+        uint8_t sc[4];
+#pragma unroll
+        for (int r = 0; r < 4; ++r) { wv[r] = __ldg(wp[r] + rd * 4 + q); sc[r] = __ldg(sp[r] + rd * 4 + q); }
+        float4 xv[4];
+#pragma unroll
+        for (int c = 0; c < 4; ++c) xv[c] = xok ? __ldg(xp + rd * 16 + 4 * q + c) : make_float4(0, 0, 0, 0);
+        uint32_t b[8];
+#pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            __half2 h;
+            h = __floats2half2_rn(xv[c].x, xv[c].y); b[2 * c] = *reinterpret_cast<uint32_t*>(&h);
+            h = __floats2half2_rn(xv[c].z, xv[c].w); b[2 * c + 1] = *reinterpret_cast<uint32_t*>(&h);
+        }
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {   // m-tile: rows g (r = 2i) and g + 8 (r = 2i + 1)
+            const float s0 = e4[sc[2 * i]], s1 = e4[sc[2 * i + 1]];
+            const uint32_t u0[2] = {wv[2 * i].x, wv[2 * i].y}, u1[2] = {wv[2 * i + 1].x, wv[2 * i + 1].y};
+            float c0 = acc[4 * i], c1 = acc[4 * i + 1], c2 = acc[4 * i + 2], c3 = acc[4 * i + 3];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {   // byte j of the 8: columns (2j, 2j + 1) of the lane's 16
+                const uint32_t by0 = (u0[j >> 2] >> (8 * (j & 3))) & 0xffu, by1 = (u1[j >> 2] >> (8 * (j & 3))) & 0xffu;
+                const float2 p0 = e2m1x2(by0), p1 = e2m1x2(by1);
+                __half2 h0 = __floats2half2_rn(p0.x * s0, p0.y * s0), h1 = __floats2half2_rn(p1.x * s1, p1.y * s1);
+                mma_m16n8k8(c0, c1, c2, c3, *reinterpret_cast<uint32_t*>(&h0), *reinterpret_cast<uint32_t*>(&h1), b[j]);
+            }
+            acc[4 * i] = c0; acc[4 * i + 1] = c1; acc[4 * i + 2] = c2; acc[4 * i + 3] = c3;
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < 8; ++i) red[w][lane][i] = acc[i];
+    __syncthreads();
+    {
+        const int l = threadIdx.x & 31, el8 = threadIdx.x >> 5;
+        float sum = 0.0f;
+#pragma unroll
+        for (int ww = 0; ww < 8; ++ww) sum += red[ww][l][el8];
+        const int gg = l >> 2, qq = l & 3, i = el8 >> 2, el = el8 & 3;
+        const int row = row_base + i * 16 + gg + (el >> 1) * 8, tok = 2 * qq + (el & 1);
+        if (row < N && tok < nr) C[(size_t) (r0 + tok) * N + row] = sum * factors[e];
+    }
+}
+
 // int8 rows -> fp16 (prefill: the cuBLAS half GEMM reads the dequantized matrix from PF.wh)
 __global__ void kb_q8_to_f16(const int8_t* __restrict__ Q, const uint16_t* __restrict__ S, half* __restrict__ dst, size_t n) {
     const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -2082,6 +2164,8 @@ void* upload(const void* p, size_t bytes) {
 float* dvec(const vec& v) { return (float*) upload(v.data(), v.size() * 4); }
 
 struct DMat { const uint16_t* d = nullptr; int n = 0, k = 0; const int8_t* q = nullptr; const uint16_t* s = nullptr; };   // q / s: INK2_Q8 copy
+static const bool g_tight_grid = !(std::getenv("INK2_TIGHT_GRID") && std::atoi(std::getenv("INK2_TIGHT_GRID")) == 0);
+static const bool g_mma_moe = !(std::getenv("INK2_MMA_MOE") && std::atoi(std::getenv("INK2_MMA_MOE")) == 0);
 static const bool g_mma = !(std::getenv("INK2_MMA") && std::atoi(std::getenv("INK2_MMA")) == 0);
 static const int g_q8 = std::getenv("INK2_Q8") ? std::atoi(std::getenv("INK2_Q8")) : 1;   // int8 weights, bit mask (default 1; 0 = all BF16): 1 unembed, 2 wo, 4 proj (q/k/v and the small rows stacked with them)
 
@@ -3510,6 +3594,29 @@ template <class F> void expert_parts(int l, bool partB, F launch) {
     }
 }
 
+// INK2_MOECHECK=1: after each tensor-core grouped product, run the CUDA-core one into a scratch buffer and print the relative error (first 8 calls)
+void moe_check(const char* what, int l, int T, const float* mma_out, int n_rows_total, const std::function<void(float*)>& run_ref) {
+    static int printed = 0, calls = 0;
+    if (!std::getenv("INK2_MOECHECK") || printed >= 8) return;
+    cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+    cudaStreamIsCapturing(cudaStreamPerThread, &cap);
+    if (calls++ < 3) std::fprintf(stderr, "moecheck call %s layer %d T=%d capture=%d\n", what, l, T, (int) cap);
+    if (cap != cudaStreamCaptureStatusNone) return;   // graph capture: no syncs or allocations
+    static float* scratch = nullptr;
+    if (!scratch) scratch = dfloats((size_t) SMALL_T * TOPK * 2 * FF);
+    CK(cudaMemset(scratch, 0, (size_t) n_rows_total * 4));
+    run_ref(scratch);
+    CK(cudaDeviceSynchronize());
+    std::vector<float> a(n_rows_total), b(n_rows_total);
+    CK(cudaMemcpy(a.data(), mma_out, (size_t) n_rows_total * 4, cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(b.data(), scratch, (size_t) n_rows_total * 4, cudaMemcpyDeviceToHost));
+    double num = 0, den = 0, mx = 0;
+    for (int i = 0; i < n_rows_total; ++i) { const double d = (double) a[i] - b[i]; num += d * d; den += (double) b[i] * b[i]; mx = std::max(mx, std::fabs(d)); }
+    std::fprintf(stderr, "moecheck %s layer %d T=%d: rel err %.3e (max abs %.3e, rms ref %.3e)\n", what, l, T, std::sqrt(num / std::max(den, 1e-30)), mx,
+                 std::sqrt(den / n_rows_total));
+    ++printed;
+}
+
 void moe_b(const Layer& Y, const float* x, float* out, int T, int pos0) {
     gemm(Y.router, x, H, PF.rl, NE, T);
     if (E.rec_mode == 2)
@@ -3526,13 +3633,33 @@ void moe_b(const Layer& Y, const float* x, float* out, int T, int pos0) {
                          : RR == 1 ? (X.nvfp4 ? k_moe_gemv_grp<true, 1> : k_moe_gemv_grp<false, 1>)
                                    : (X.nvfp4 ? k_moe_gemv_grp<true, 4> : k_moe_gemv_grp<false, 4>);
         auto parts = [&](bool partB, auto launch) { if (E.offload) launch(partB ? X.tB : X.tA); else expert_parts(l, partB, launch); };
+        // T <= SMALL_T: every expert has at most SMALL_T rows (one tile), so there are at most min(T * TOPK, NE) tiles (maxt = nr / FM + NE
+        // is the prefill bound: 129 grid rows, two thirds of them empty blocks that still cost a launch and a read of *ntiles)
+        const int maxt_s = g_tight_grid ? std::min(nr, NE) : maxt;
+        const bool mma_moe = g_mma_moe && X.nvfp4;
         parts(false, [&](const uint8_t* const* t) {
-            g<<<dim3(2 * FF / (8 * RR), maxt), 256>>>(x, H, PF.rows, t, X.f13, PF.tile_e, PF.tile_r0, PF.ntiles, PF.eoff,
+            if (mma_moe) {
+                k_moe_mma_grp<<<dim3((2 * FF + 31) / 32, maxt_s), 256>>>(x, H, PF.rows, t, X.f13, PF.tile_e, PF.tile_r0, PF.ntiles, PF.eoff,
+                                                                          PF.ecnt, PF.gu, 2 * FF, H);
+                moe_check("gate_up", l, T, PF.gu, nr * 2 * FF, [&](float* o) {
+                    k_moe_gemv_grp<true, 4><<<dim3(2 * FF / 32, maxt_s), 256>>>(x, H, PF.rows, t, X.f13, PF.tile_e, PF.tile_r0, PF.ntiles,
+                                                                               PF.eoff, PF.ecnt, o, 2 * FF, H);
+                });
+            } else
+            g<<<dim3(2 * FF / (8 * RR), maxt_s), 256>>>(x, H, PF.rows, t, X.f13, PF.tile_e, PF.tile_r0, PF.ntiles, PF.eoff,
                                                  PF.ecnt, PF.gu, 2 * FF, H);
         });
         kb_swiglu<<<(unsigned) (((size_t) nr * FF + 255) / 256), 256>>>(PF.gu, PF.act, nr);
         parts(true, [&](const uint8_t* const* t) {
-            g<<<dim3(H / (8 * RR), maxt), 256>>>(PF.act, FF, nullptr, t, X.f2, PF.tile_e, PF.tile_r0, PF.ntiles, PF.eoff,
+            if (mma_moe) {
+                k_moe_mma_grp<<<dim3((H + 31) / 32, maxt_s), 256>>>(PF.act, FF, nullptr, t, X.f2, PF.tile_e, PF.tile_r0, PF.ntiles, PF.eoff,
+                                                                     PF.ecnt, PF.ey, H, FF);
+                moe_check("down", l, T, PF.ey, nr * H, [&](float* o) {
+                    k_moe_gemv_grp<true, 4><<<dim3(H / 32, maxt_s), 256>>>(PF.act, FF, nullptr, t, X.f2, PF.tile_e, PF.tile_r0, PF.ntiles,
+                                                                          PF.eoff, PF.ecnt, o, H, FF);
+                });
+            } else
+            g<<<dim3(H / (8 * RR), maxt_s), 256>>>(PF.act, FF, nullptr, t, X.f2, PF.tile_e, PF.tile_r0, PF.ntiles, PF.eoff,
                                             PF.ecnt, PF.ey, H, FF);
         });
     } else if (PF.tc) {
