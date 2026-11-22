@@ -50,7 +50,7 @@ size alone gives a KL of 0.12 (a different cuBLAS kernel flips near-tied routing
 
 `terminal/tools/inkling2/ink2-serve start|stop|status|logs` runs one engine per GPU (`ink2_shim.py`, an OpenAI endpoint) behind `ink2_pool.py`,
 which sends each request to an idle engine and queues the rest (two engines: two streams at once, any more wait their turn).
-Environment: `GPUS="0 1" CTX=131072 KV=i8 CHUNK=1024 RESERVE=800 SPEC=1 Q8=1 PORT=8080 HOST=127.0.0.1`.
+Environment: `GPUS="0 1" CTX=131072 KV=i8 CHUNK=1024 RESERVE=800 SPEC=1 Q8=15 PORT=8080 HOST=127.0.0.1`.
 
 ## Profiling without Nsight
 
