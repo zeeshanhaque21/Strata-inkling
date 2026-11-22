@@ -1371,13 +1371,20 @@ __global__ void __launch_bounds__(256) k_moe_mma_grp(const float* __restrict__ A
                                                      const uint8_t* const* __restrict__ tab, const float* __restrict__ factors,
                                                      const int* __restrict__ tile_e, const int* __restrict__ tile_r0,
                                                      const int* __restrict__ ntiles, const int* __restrict__ eoff,
-                                                     const int* __restrict__ ecnt, float* __restrict__ C, int N, int K) {
+                                                     const int* __restrict__ ecnt, float* __restrict__ C, int N, int K,
+                                                     const int* __restrict__ pids, int a_same) {
+    // pids != nullptr: plain decode, blockIdx.y = k selects expert pids[k], one token, output row k (no tiles); a_same: every tile reads A row 0.
     // NV: NVFP4 (K / 2 bytes a row, one e4m3 scale per 16 columns).  !NV: MXFP8 (K bytes a row, one UE8M0 byte per 32 columns), stored
     // x 2^10 like kb_moe_gemm_tc (the 2^-10 comes back on the output); a lane takes 16 columns = one uint4 and one scale byte.
     __shared__ float red[8][32][8 + 1];
     __shared__ uint32_t e4h[NV ? 256 : 1];   // e4m3 scale as a half2 pair (exact in fp16, 448 max, 2^-9 min)
-    if ((int) blockIdx.y >= *ntiles) return;
-    const int e = tile_e[blockIdx.y], r0 = tile_r0[blockIdx.y], nr = min(eoff[e] + ecnt[e] - r0, SMALL_T);
+    int e, r0, nr;
+    if (pids) {
+        e = pids[blockIdx.y]; r0 = blockIdx.y; nr = 1;
+    } else {
+        if ((int) blockIdx.y >= *ntiles) return;
+        e = tile_e[blockIdx.y]; r0 = tile_r0[blockIdx.y]; nr = min(eoff[e] + ecnt[e] - r0, SMALL_T);
+    }
     const uint8_t* Wt = tab[e];
     if (!Wt) return;   // computed on the CPU (--cpu-threads)
     const int row_base = blockIdx.x * 32;
@@ -1401,7 +1408,7 @@ __global__ void __launch_bounds__(256) k_moe_mma_grp(const float* __restrict__ A
         sp[r] = S + (size_t) row * (K / SC_DIV);
     }
     const bool xok = g < nr;
-    const float4* xp = reinterpret_cast<const float4*>(A + (size_t) (xok ? (rows ? rows[r0 + g] : r0 + g) : 0) * lda);
+    const float4* xp = reinterpret_cast<const float4*>(A + (size_t) (xok ? (a_same ? 0 : (rows ? rows[r0 + g] : r0 + g)) : 0) * lda);
     float acc[8];
 #pragma unroll
     for (int i = 0; i < 8; ++i) acc[i] = 0.0f;
@@ -2205,6 +2212,7 @@ float* dvec(const vec& v) { return (float*) upload(v.data(), v.size() * 4); }
 
 struct DMat { const uint16_t* d = nullptr; int n = 0, k = 0; const int8_t* q = nullptr; const uint16_t* s = nullptr; };   // q / s: INK2_Q8 copy
 static const bool g_tight_grid = !(std::getenv("INK2_TIGHT_GRID") && std::atoi(std::getenv("INK2_TIGHT_GRID")) == 0);
+static const bool g_mma_plain = !(std::getenv("INK2_MMA_PLAIN") && std::atoi(std::getenv("INK2_MMA_PLAIN")) == 0);
 static const bool g_mma_moe = !(std::getenv("INK2_MMA_MOE") && std::atoi(std::getenv("INK2_MMA_MOE")) == 0);
 static const bool g_mma = !(std::getenv("INK2_MMA") && std::atoi(std::getenv("INK2_MMA")) == 0);
 static const int g_q8 = std::getenv("INK2_Q8") ? std::atoi(std::getenv("INK2_Q8")) : 1;   // int8 weights, bit mask (default 1; 0 = all BF16): 1 unembed, 2 wo, 4 proj, 8 the drafter's dense weights (q/k/v and the small rows stacked with them)
@@ -3197,7 +3205,21 @@ void moe(const Layer& Y, const float* x, const float* r, float* mhist, const flo
     if (E.cpu) expert_cpu_ring(int(&Y - E.L), x);
     else if (E.offload) expert_cache(int(&Y - E.L), E.ids, TOPK);
     const Experts& X = Y.ex;
-    if (X.nvfp4) {
+    if (g_mma_plain) {   // tensor-core experts for the single token (INK2_MMA_PLAIN=0: the CUDA-core kernels below)
+        if (X.nvfp4) {
+            k_moe_mma_grp<true><<<dim3((2 * FF + 31) / 32, TOPK), 256>>>(x, H, nullptr, X.tA, X.f13, nullptr, nullptr, nullptr, nullptr, nullptr,
+                                                                          E.gu, 2 * FF, H, E.ids, 1);
+            kb_swiglu<<<(TOPK * FF + 255) / 256, 256>>>(E.gu, E.act, TOPK);
+            k_moe_mma_grp<true><<<dim3((H + 31) / 32, TOPK), 256>>>(E.act, FF, nullptr, X.tB, X.f2, nullptr, nullptr, nullptr, nullptr, nullptr,
+                                                                     E.ey, H, FF, E.ids, 0);
+        } else {
+            k_moe_mma_grp<false><<<dim3((2 * FF + 31) / 32, TOPK), 256>>>(x, H, nullptr, X.tA, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                                                                           E.gu, 2 * FF, H, E.ids, 1);
+            kb_swiglu<<<(TOPK * FF + 255) / 256, 256>>>(E.gu, E.act, TOPK);
+            k_moe_mma_grp<false><<<dim3((H + 31) / 32, TOPK), 256>>>(E.act, FF, nullptr, X.tB, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                                                                      E.ey, H, FF, E.ids, 0);
+        }
+    } else if (X.nvfp4) {
 #define SEL(R) \
         k_gemv_nvfp4_sel<R><<<dim3(2 * FF / (8 * R), TOPK), 256, (H + 256) * 4>>>(X.tA, X.f13, E.ids, x, 0, E.gu, 2 * FF, H); \
         k_gemv_nvfp4_sel<R, true><<<dim3(H / (8 * R), TOPK), 256, (FF + 256) * 4>>>(X.tB, X.f2, E.ids, E.gu, 2 * FF, E.ey, H, FF);
@@ -3680,10 +3702,10 @@ void moe_b(const Layer& Y, const float* x, float* out, int T, int pos0) {
             if (mma_moe) {
                 if (X.nvfp4)
                     k_moe_mma_grp<true><<<dim3((2 * FF + 31) / 32, maxt_s), 256>>>(x, H, PF.rows, t, X.f13, PF.tile_e, PF.tile_r0, PF.ntiles, PF.eoff,
-                                                                                    PF.ecnt, PF.gu, 2 * FF, H);
+                                                                                    PF.ecnt, PF.gu, 2 * FF, H, nullptr, 0);
                 else
                     k_moe_mma_grp<false><<<dim3((2 * FF + 31) / 32, maxt_s), 256>>>(x, H, PF.rows, t, X.f13, PF.tile_e, PF.tile_r0, PF.ntiles, PF.eoff,
-                                                                                     PF.ecnt, PF.gu, 2 * FF, H);
+                                                                                     PF.ecnt, PF.gu, 2 * FF, H, nullptr, 0);
                 moe_check("gate_up", l, T, PF.gu, nr * 2 * FF, [&](float* o) {
                     if (X.nvfp4)
                         k_moe_gemv_grp<true, 4><<<dim3(2 * FF / 32, maxt_s), 256>>>(x, H, PF.rows, t, X.f13, PF.tile_e, PF.tile_r0, PF.ntiles,
@@ -3701,10 +3723,10 @@ void moe_b(const Layer& Y, const float* x, float* out, int T, int pos0) {
             if (mma_moe) {
                 if (X.nvfp4)
                     k_moe_mma_grp<true><<<dim3((H + 31) / 32, maxt_s), 256>>>(PF.act, FF, nullptr, t, X.f2, PF.tile_e, PF.tile_r0, PF.ntiles, PF.eoff,
-                                                                               PF.ecnt, PF.ey, H, FF);
+                                                                               PF.ecnt, PF.ey, H, FF, nullptr, 0);
                 else
                     k_moe_mma_grp<false><<<dim3((H + 31) / 32, maxt_s), 256>>>(PF.act, FF, nullptr, t, X.f2, PF.tile_e, PF.tile_r0, PF.ntiles, PF.eoff,
-                                                                                PF.ecnt, PF.ey, H, FF);
+                                                                                PF.ecnt, PF.ey, H, FF, nullptr, 0);
                 moe_check("down", l, T, PF.ey, nr * H, [&](float* o) {
                     if (X.nvfp4)
                         k_moe_gemv_grp<true, 4><<<dim3(H / 32, maxt_s), 256>>>(PF.act, FF, nullptr, t, X.f2, PF.tile_e, PF.tile_r0, PF.ntiles,
