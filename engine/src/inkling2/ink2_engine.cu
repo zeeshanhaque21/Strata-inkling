@@ -1366,33 +1366,39 @@ __global__ void __launch_bounds__(256) k_mma_q8_multi(const int8_t* __restrict__
 // after the MMAs and a lane can take 16 contiguous columns (8 B of a row, one scale byte): the 4 lanes of a row read one 32 B
 // sector.  k step j of a lane is its columns (16q + 2j, 16q + 2j + 1) in A and in B (consistent permutation).
 // Block = 8 warps on 32 weight rows, split K by 64-column rounds, reduced through shared memory.
+template <bool NV>
 __global__ void __launch_bounds__(256) k_moe_mma_grp(const float* __restrict__ A, int lda, const int* __restrict__ rows,
                                                      const uint8_t* const* __restrict__ tab, const float* __restrict__ factors,
                                                      const int* __restrict__ tile_e, const int* __restrict__ tile_r0,
                                                      const int* __restrict__ ntiles, const int* __restrict__ eoff,
                                                      const int* __restrict__ ecnt, float* __restrict__ C, int N, int K) {
+    // NV: NVFP4 (K / 2 bytes a row, one e4m3 scale per 16 columns).  !NV: MXFP8 (K bytes a row, one UE8M0 byte per 32 columns), stored
+    // x 2^10 like kb_moe_gemm_tc (the 2^-10 comes back on the output); a lane takes 16 columns = one uint4 and one scale byte.
     __shared__ float red[8][32][8 + 1];
-    __shared__ uint32_t e4h[256];   // e4m3 scale as a half2 pair (exact in fp16, 448 max, 2^-9 min)
+    __shared__ uint32_t e4h[NV ? 256 : 1];   // e4m3 scale as a half2 pair (exact in fp16, 448 max, 2^-9 min)
     if ((int) blockIdx.y >= *ntiles) return;
     const int e = tile_e[blockIdx.y], r0 = tile_r0[blockIdx.y], nr = min(eoff[e] + ecnt[e] - r0, SMALL_T);
     const uint8_t* Wt = tab[e];
     if (!Wt) return;   // computed on the CPU (--cpu-threads)
     const int row_base = blockIdx.x * 32;
     if (row_base >= N) return;
-    for (int i = threadIdx.x; i < 256; i += blockDim.x) {
-        const __half2 hh = __float2half2_rn(e4m3_decode(i));
-        e4h[i] = *reinterpret_cast<const uint32_t*>(&hh);
+    if (NV) {
+        for (int i = threadIdx.x; i < 256; i += blockDim.x) {
+            const __half2 hh = __float2half2_rn(e4m3_decode(i));
+            e4h[i] = *reinterpret_cast<const uint32_t*>(&hh);
+        }
+        __syncthreads();
     }
-    __syncthreads();
     const int lane = threadIdx.x & 31, w = threadIdx.x >> 5, g = lane >> 2, q = lane & 3;
-    const uint8_t* S = Wt + (size_t) N * (K / 2);
-    const uint2* wp[4];
+    constexpr int ROWB_DIV = NV ? 2 : 1, SC_DIV = NV ? 16 : 32;
+    const uint8_t* S = Wt + (size_t) N * (K / ROWB_DIV);
+    const uint4* wp[4];
     const uint8_t* sp[4];
 #pragma unroll
     for (int r = 0; r < 4; ++r) {
         const int row = min(row_base + (r >> 1) * 16 + g + (r & 1) * 8, N - 1);
-        wp[r] = reinterpret_cast<const uint2*>(Wt + (size_t) row * (K / 2));
-        sp[r] = S + (size_t) row * (K / 16);
+        wp[r] = reinterpret_cast<const uint4*>(Wt + (size_t) row * (K / ROWB_DIV));
+        sp[r] = S + (size_t) row * (K / SC_DIV);
     }
     const bool xok = g < nr;
     const float4* xp = reinterpret_cast<const float4*>(A + (size_t) (xok ? (rows ? rows[r0 + g] : r0 + g) : 0) * lda);
@@ -1402,10 +1408,19 @@ __global__ void __launch_bounds__(256) k_moe_mma_grp(const float* __restrict__ A
     const int nround = K / 64;
 #pragma unroll 2
     for (int rd = w; rd < nround; rd += 8) {
-        uint2 wv[4];
+        uint4 wv[4];
         uint8_t sc[4];
 #pragma unroll
-        for (int r = 0; r < 4; ++r) { wv[r] = __ldg(wp[r] + rd * 4 + q); sc[r] = __ldg(sp[r] + rd * 4 + q); }
+        for (int r = 0; r < 4; ++r) {
+            if (NV) {   // 8 B of the row for this lane (the uint4 array is addressed as uint2)
+                const uint2 t8 = __ldg(reinterpret_cast<const uint2*>(wp[r]) + rd * 4 + q);
+                wv[r] = make_uint4(t8.x, t8.y, 0, 0);
+                sc[r] = __ldg(sp[r] + rd * 4 + q);
+            } else {
+                wv[r] = __ldg(wp[r] + rd * 4 + q);
+                sc[r] = __ldg(sp[r] + rd * 2 + (q >> 1));
+            }
+        }
         float4 xv[4];
 #pragma unroll
         for (int c = 0; c < 4; ++c) xv[c] = xok ? __ldg(xp + rd * 16 + 4 * q + c) : make_float4(0, 0, 0, 0);
@@ -1418,17 +1433,32 @@ __global__ void __launch_bounds__(256) k_moe_mma_grp(const float* __restrict__ A
         }
 #pragma unroll
         for (int i = 0; i < 2; ++i) {   // m-tile: rows g (r = 2i) and g + 8 (r = 2i + 1)
-            const uint32_t s0 = e4h[sc[2 * i]], s1 = e4h[sc[2 * i + 1]];
-            const uint32_t u0[2] = {wv[2 * i].x, wv[2 * i].y}, u1[2] = {wv[2 * i + 1].x, wv[2 * i + 1].y};
             float c0 = acc[4 * i], c1 = acc[4 * i + 1], c2 = acc[4 * i + 2], c3 = acc[4 * i + 3];
+            if (NV) {
+                const uint32_t s0 = e4h[sc[2 * i]], s1 = e4h[sc[2 * i + 1]];
+                const uint32_t u0[2] = {wv[2 * i].x, wv[2 * i].y}, u1[2] = {wv[2 * i + 1].x, wv[2 * i + 1].y};
 #pragma unroll
-            for (int j = 0; j < 8; ++j) {   // byte j of the 8: columns (2j, 2j + 1) of the lane's 16
-                const uint32_t by0 = (u0[j >> 2] >> (8 * (j & 3))) & 0xffu, by1 = (u1[j >> 2] >> (8 * (j & 3))) & 0xffu;
-                // value * 2^-14 times the scale, in fp16: exact (every product is a multiple of 2^-24); the 2^14 comes back at the end
-                const uint32_t p0 = e2m1x2_h(by0), p1 = e2m1x2_h(by1);
-                const __half2 h0 = __hmul2(*reinterpret_cast<const __half2*>(&p0), *reinterpret_cast<const __half2*>(&s0));
-                const __half2 h1 = __hmul2(*reinterpret_cast<const __half2*>(&p1), *reinterpret_cast<const __half2*>(&s1));
-                mma_m16n8k8(c0, c1, c2, c3, *reinterpret_cast<const uint32_t*>(&h0), *reinterpret_cast<const uint32_t*>(&h1), b[j]);
+                for (int j = 0; j < 8; ++j) {   // byte j of the 8: columns (2j, 2j + 1) of the lane's 16
+                    const uint32_t by0 = (u0[j >> 2] >> (8 * (j & 3))) & 0xffu, by1 = (u1[j >> 2] >> (8 * (j & 3))) & 0xffu;
+                    // value * 2^-14 times the scale, in fp16: exact (every product is a multiple of 2^-24); the 2^14 comes back at the end
+                    const uint32_t p0 = e2m1x2_h(by0), p1 = e2m1x2_h(by1);
+                    const __half2 h0 = __hmul2(*reinterpret_cast<const __half2*>(&p0), *reinterpret_cast<const __half2*>(&s0));
+                    const __half2 h1 = __hmul2(*reinterpret_cast<const __half2*>(&p1), *reinterpret_cast<const __half2*>(&s1));
+                    mma_m16n8k8(c0, c1, c2, c3, *reinterpret_cast<const uint32_t*>(&h0), *reinterpret_cast<const uint32_t*>(&h1), b[j]);
+                }
+            } else {
+                const float s0 = exp2f((float) sc[2 * i] - 109.0f), s1 = exp2f((float) sc[2 * i + 1] - 109.0f);   // 2^(s-127) 2^8 2^10
+                const uint32_t u0[4] = {wv[2 * i].x, wv[2 * i].y, wv[2 * i].z, wv[2 * i].w};
+                const uint32_t u1[4] = {wv[2 * i + 1].x, wv[2 * i + 1].y, wv[2 * i + 1].z, wv[2 * i + 1].w};
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {   // bytes (2j, 2j + 1) of the 16
+                    const uint32_t wa = u0[j >> 1], wb = u1[j >> 1];
+                    const uint32_t pa = (j & 1) ? (((wa >> 16) & 0xffu) | ((wa & 0xff000000u) >> 8)) : ((wa & 0xffu) | ((wa & 0xff00u) << 8));
+                    const uint32_t pb = (j & 1) ? (((wb >> 16) & 0xffu) | ((wb & 0xff000000u) >> 8)) : ((wb & 0xffu) | ((wb & 0xff00u) << 8));
+                    const float2 fa = e4m3x2(pa), fb = e4m3x2(pb);
+                    const __half2 h0 = __floats2half2_rn(fa.x * s0, fa.y * s0), h1 = __floats2half2_rn(fb.x * s1, fb.y * s1);
+                    mma_m16n8k8(c0, c1, c2, c3, *reinterpret_cast<const uint32_t*>(&h0), *reinterpret_cast<const uint32_t*>(&h1), b[j]);
+                }
             }
             acc[4 * i] = c0; acc[4 * i + 1] = c1; acc[4 * i + 2] = c2; acc[4 * i + 3] = c3;
         }
@@ -1443,7 +1473,7 @@ __global__ void __launch_bounds__(256) k_moe_mma_grp(const float* __restrict__ A
         for (int ww = 0; ww < 8; ++ww) sum += red[ww][l][el8];
         const int gg = l >> 2, qq = l & 3, i = el8 >> 2, el = el8 & 3;
         const int row = row_base + i * 16 + gg + (el >> 1) * 8, tok = 2 * qq + (el & 1);
-        if (row < N && tok < nr) C[(size_t) (r0 + tok) * N + row] = (sum * 16384.0f) * factors[e];
+        if (row < N && tok < nr) C[(size_t) (r0 + tok) * N + row] = NV ? (sum * 16384.0f) * factors[e] : sum * (1.0f / 1024.0f);
     }
 }
 
@@ -3607,11 +3637,10 @@ template <class F> void expert_parts(int l, bool partB, F launch) {
 // INK2_MOECHECK=1: after each tensor-core grouped product, run the CUDA-core one into a scratch buffer and print the relative error (first 8 calls)
 void moe_check(const char* what, int l, int T, const float* mma_out, int n_rows_total, const std::function<void(float*)>& run_ref) {
     static int printed = 0, calls = 0;
-    if (!std::getenv("INK2_MOECHECK") || printed >= 8) return;
+    if (!std::getenv("INK2_MOECHECK") || printed >= 8 || l < std::atoi(std::getenv("INK2_MOECHECK"))) return;   // INK2_MOECHECK=<first layer to check>
     cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
     cudaStreamIsCapturing(cudaStreamPerThread, &cap);
-    if (calls++ < 3) std::fprintf(stderr, "moecheck call %s layer %d T=%d capture=%d\n", what, l, T, (int) cap);
-    if (cap != cudaStreamCaptureStatusNone) return;   // graph capture: no syncs or allocations
+        if (cap != cudaStreamCaptureStatusNone) return;   // graph capture: no syncs or allocations
     static float* scratch = nullptr;
     if (!scratch) scratch = dfloats((size_t) SMALL_T * TOPK * 2 * FF);
     CK(cudaMemset(scratch, 0, (size_t) n_rows_total * 4));
@@ -3646,14 +3675,22 @@ void moe_b(const Layer& Y, const float* x, float* out, int T, int pos0) {
         // T <= SMALL_T: every expert has at most SMALL_T rows (one tile), so there are at most min(T * TOPK, NE) tiles (maxt = nr / FM + NE
         // is the prefill bound: 129 grid rows, two thirds of them empty blocks that still cost a launch and a read of *ntiles)
         const int maxt_s = g_tight_grid ? std::min(nr, NE) : maxt;
-        const bool mma_moe = g_mma_moe && X.nvfp4;
+        const bool mma_moe = g_mma_moe;
         parts(false, [&](const uint8_t* const* t) {
             if (mma_moe) {
-                k_moe_mma_grp<<<dim3((2 * FF + 31) / 32, maxt_s), 256>>>(x, H, PF.rows, t, X.f13, PF.tile_e, PF.tile_r0, PF.ntiles, PF.eoff,
-                                                                          PF.ecnt, PF.gu, 2 * FF, H);
+                if (X.nvfp4)
+                    k_moe_mma_grp<true><<<dim3((2 * FF + 31) / 32, maxt_s), 256>>>(x, H, PF.rows, t, X.f13, PF.tile_e, PF.tile_r0, PF.ntiles, PF.eoff,
+                                                                                    PF.ecnt, PF.gu, 2 * FF, H);
+                else
+                    k_moe_mma_grp<false><<<dim3((2 * FF + 31) / 32, maxt_s), 256>>>(x, H, PF.rows, t, X.f13, PF.tile_e, PF.tile_r0, PF.ntiles, PF.eoff,
+                                                                                     PF.ecnt, PF.gu, 2 * FF, H);
                 moe_check("gate_up", l, T, PF.gu, nr * 2 * FF, [&](float* o) {
-                    k_moe_gemv_grp<true, 4><<<dim3(2 * FF / 32, maxt_s), 256>>>(x, H, PF.rows, t, X.f13, PF.tile_e, PF.tile_r0, PF.ntiles,
-                                                                               PF.eoff, PF.ecnt, o, 2 * FF, H);
+                    if (X.nvfp4)
+                        k_moe_gemv_grp<true, 4><<<dim3(2 * FF / 32, maxt_s), 256>>>(x, H, PF.rows, t, X.f13, PF.tile_e, PF.tile_r0, PF.ntiles,
+                                                                                   PF.eoff, PF.ecnt, o, 2 * FF, H);
+                    else
+                        k_moe_gemv_grp<false, 4><<<dim3(2 * FF / 32, maxt_s), 256>>>(x, H, PF.rows, t, X.f13, PF.tile_e, PF.tile_r0, PF.ntiles,
+                                                                                    PF.eoff, PF.ecnt, o, 2 * FF, H);
                 });
             } else
             g<<<dim3(2 * FF / (8 * RR), maxt_s), 256>>>(x, H, PF.rows, t, X.f13, PF.tile_e, PF.tile_r0, PF.ntiles, PF.eoff,
@@ -3662,11 +3699,19 @@ void moe_b(const Layer& Y, const float* x, float* out, int T, int pos0) {
         kb_swiglu<<<(unsigned) (((size_t) nr * FF + 255) / 256), 256>>>(PF.gu, PF.act, nr);
         parts(true, [&](const uint8_t* const* t) {
             if (mma_moe) {
-                k_moe_mma_grp<<<dim3((H + 31) / 32, maxt_s), 256>>>(PF.act, FF, nullptr, t, X.f2, PF.tile_e, PF.tile_r0, PF.ntiles, PF.eoff,
-                                                                     PF.ecnt, PF.ey, H, FF);
+                if (X.nvfp4)
+                    k_moe_mma_grp<true><<<dim3((H + 31) / 32, maxt_s), 256>>>(PF.act, FF, nullptr, t, X.f2, PF.tile_e, PF.tile_r0, PF.ntiles, PF.eoff,
+                                                                               PF.ecnt, PF.ey, H, FF);
+                else
+                    k_moe_mma_grp<false><<<dim3((H + 31) / 32, maxt_s), 256>>>(PF.act, FF, nullptr, t, X.f2, PF.tile_e, PF.tile_r0, PF.ntiles, PF.eoff,
+                                                                                PF.ecnt, PF.ey, H, FF);
                 moe_check("down", l, T, PF.ey, nr * H, [&](float* o) {
-                    k_moe_gemv_grp<true, 4><<<dim3(H / 32, maxt_s), 256>>>(PF.act, FF, nullptr, t, X.f2, PF.tile_e, PF.tile_r0, PF.ntiles,
-                                                                          PF.eoff, PF.ecnt, o, H, FF);
+                    if (X.nvfp4)
+                        k_moe_gemv_grp<true, 4><<<dim3(H / 32, maxt_s), 256>>>(PF.act, FF, nullptr, t, X.f2, PF.tile_e, PF.tile_r0, PF.ntiles,
+                                                                              PF.eoff, PF.ecnt, o, H, FF);
+                    else
+                        k_moe_gemv_grp<false, 4><<<dim3(H / 32, maxt_s), 256>>>(PF.act, FF, nullptr, t, X.f2, PF.tile_e, PF.tile_r0, PF.ntiles,
+                                                                               PF.eoff, PF.ecnt, o, H, FF);
                 });
             } else
             g<<<dim3(H / (8 * RR), maxt_s), 256>>>(PF.act, FF, nullptr, t, X.f2, PF.tile_e, PF.tile_r0, PF.ntiles, PF.eoff,
