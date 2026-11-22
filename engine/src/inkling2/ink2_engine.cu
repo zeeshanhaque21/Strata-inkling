@@ -1929,7 +1929,7 @@ void* upload(const void* p, size_t bytes) {
 float* dvec(const vec& v) { return (float*) upload(v.data(), v.size() * 4); }
 
 struct DMat { const uint16_t* d = nullptr; int n = 0, k = 0; const int8_t* q = nullptr; const uint16_t* s = nullptr; };   // q / s: INK2_Q8 copy
-static const bool g_q8 = std::getenv("INK2_Q8") != nullptr && std::atoi(std::getenv("INK2_Q8")) != 0;
+static const int g_q8 = std::getenv("INK2_Q8") ? std::atoi(std::getenv("INK2_Q8")) : 0;   // bit mask: 1 unembed, 2 wo, 4 proj (q/k/v and the small rows stacked with them)
 
 // Experts live in fixed-size slots of a device pool (one pool per format), each slot one expert as
 // [w13 | w13 scales | w2 | w2 scales] (part A = w13 + scales, part B = w2 + scales).  The kernels address an expert
@@ -2090,8 +2090,13 @@ DMat dmat_stack(const std::vector<std::string>& names) {   // BF16 matrices with
 }
 
 // INK2_Q8=1: an int8 copy of a dense BF16 matrix for the decode GEMVs (the BF16 copy stays for the prefill / spec paths for now)
-void quantize_q8(DMat& m) {
-    if (!g_q8) return;
+void quantize_q8(DMat& m, int bit, int layer = -1) {
+    if (!(g_q8 & bit)) return;
+    if (layer >= 0 && std::getenv("INK2_Q8_L")) {   // INK2_Q8_L=a,b: only layers a..b (diagnostics)
+        int a = 0, b = 99;
+        std::sscanf(std::getenv("INK2_Q8_L"), "%d,%d", &a, &b);
+        if (layer < a || layer > b) return;
+    }
     if (m.k % 32) { std::fprintf(stderr, "q8: K %d not a multiple of 32\n", m.k); std::exit(1); }
     const size_t nblk = (size_t) m.n * m.k / 32;
     int8_t* q = (int8_t*) dalloc(nblk * 32);
@@ -2100,6 +2105,27 @@ void quantize_q8(DMat& m) {
     CK(cudaDeviceSynchronize());
     m.q = q;
     m.s = sc;
+    if (std::getenv("INK2_Q8CHECK")) {   // relative error of the int8 GEMV against the BF16 one, per R, on a fixed pseudo-random x
+        std::vector<float> hx(m.k);
+        for (int i = 0; i < m.k; ++i) hx[i] = std::sin(0.37f * i) + 0.5f * std::cos(1.3f * i);
+        float* x = dvec(hx);
+        float* yb = dfloats(m.n);
+        float* yq = dfloats(m.n);
+        for (int R : {1, 2, 4}) {
+            const unsigned g = (unsigned) ((m.n + 8 * R - 1) / (8 * R));
+            const size_t sm = (size_t) m.k * 4;
+            if (R == 1) { k_gemv_bf16<1><<<g, 256, sm>>>(m.d, x, yb, m.n, m.k); k_gemv_q8<1><<<g, 256, sm>>>(m.q, m.s, x, yq, m.n, m.k); }
+            if (R == 2) { k_gemv_bf16<2><<<g, 256, sm>>>(m.d, x, yb, m.n, m.k); k_gemv_q8<2><<<g, 256, sm>>>(m.q, m.s, x, yq, m.n, m.k); }
+            if (R == 4) { k_gemv_bf16<4><<<g, 256, sm>>>(m.d, x, yb, m.n, m.k); k_gemv_q8<4><<<g, 256, sm>>>(m.q, m.s, x, yq, m.n, m.k); }
+            CK(cudaDeviceSynchronize());
+            std::vector<float> a_(m.n), b_(m.n);
+            CK(cudaMemcpy(a_.data(), yb, m.n * 4, cudaMemcpyDeviceToHost));
+            CK(cudaMemcpy(b_.data(), yq, m.n * 4, cudaMemcpyDeviceToHost));
+            double num = 0, den = 0, mx = 0;
+            for (int i = 0; i < m.n; ++i) { num += (double) (a_[i] - b_[i]) * (a_[i] - b_[i]); den += (double) a_[i] * a_[i]; mx = std::max(mx, (double) std::fabs(a_[i] - b_[i])); }
+            std::fprintf(stderr, "q8check n=%d k=%d R=%d: rel err %.3e (max abs %.3e, rms ref %.3e)\n", m.n, m.k, R, std::sqrt(num / std::max(den, 1e-30)), mx, std::sqrt(den / m.n));
+        }
+    }
 }
 
 // the NUMA node of the GPU (sysfs), -1 when unknown
@@ -2128,7 +2154,7 @@ void load() {
         std::memcpy(E.embed.data(), b.data(), b.size());
     }
     E.unembed = dmat(p + "unembed.weight");
-    quantize_q8(E.unembed);
+    quantize_q8(E.unembed, 1);
     {
         const vec q = ck.f32(p + "middle_cycle_cross_pass_queries"), kv = ck.f32(p + "middle_cycle_cross_pass_kv_queries");
         vec mq((size_t) NLOOP * 4 * H);
@@ -2199,8 +2225,8 @@ void load() {
             if (Y.proj.n != Y.off_v + Y.n_v) { std::fprintf(stderr, "layer %d: stacked rows %d\n", l, Y.proj.n); std::exit(1); }
         }
         Y.wo = dmat(q + "attn.wo_ud.weight");
-        quantize_q8(Y.wo);
-        quantize_q8(Y.proj);
+        quantize_q8(Y.wo, 2, l);
+        quantize_q8(Y.proj, 4, l);
         Y.router = dmat(q + "mlp.gate.weight");
         Y.router_bias = fvec(q + "mlp.gate.bias");
         Y.q_scale = fvec(q + "attn.q_l2_clip.scale");
