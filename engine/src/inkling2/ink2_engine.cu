@@ -2207,7 +2207,7 @@ struct DMat { const uint16_t* d = nullptr; int n = 0, k = 0; const int8_t* q = n
 static const bool g_tight_grid = !(std::getenv("INK2_TIGHT_GRID") && std::atoi(std::getenv("INK2_TIGHT_GRID")) == 0);
 static const bool g_mma_moe = !(std::getenv("INK2_MMA_MOE") && std::atoi(std::getenv("INK2_MMA_MOE")) == 0);
 static const bool g_mma = !(std::getenv("INK2_MMA") && std::atoi(std::getenv("INK2_MMA")) == 0);
-static const int g_q8 = std::getenv("INK2_Q8") ? std::atoi(std::getenv("INK2_Q8")) : 1;   // int8 weights, bit mask (default 1; 0 = all BF16): 1 unembed, 2 wo, 4 proj (q/k/v and the small rows stacked with them)
+static const int g_q8 = std::getenv("INK2_Q8") ? std::atoi(std::getenv("INK2_Q8")) : 1;   // int8 weights, bit mask (default 1; 0 = all BF16): 1 unembed, 2 wo, 4 proj, 8 the drafter's dense weights (q/k/v and the small rows stacked with them)
 
 // Experts live in fixed-size slots of a device pool (one pool per format), each slot one expert as
 // [w13 | w13 scales | w2 | w2 scales] (part A = w13 + scales, part B = w2 + scales).  The kernels address an expert
@@ -4101,6 +4101,7 @@ void draft_load(const std::string& dir) {
         Y.o = dmat(q + "self_attn.o_proj.weight");
         Y.gu = dmat_stack({q + "mlp.gate_proj.weight", q + "mlp.up_proj.weight"});
         Y.down = dmat(q + "mlp.down_proj.weight");
+        for (DMat* m : {&Y.qkv, &Y.kvc, &Y.o, &Y.gu, &Y.down}) quantize_q8(*m, 8, -1, true);   // INK2_Q8 bit 8: the drafter's dense weights
         Y.in_ln = fvec(q + "input_layernorm.weight");
         Y.post_ln = fvec(q + "post_attention_layernorm.weight");
         Y.dflare = fvec(q + "dflare_norm.weight");
