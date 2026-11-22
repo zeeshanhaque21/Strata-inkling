@@ -4267,12 +4267,20 @@ int main(int argc, char** argv) {
     // token at a time through the decode graph for PLAIN_RUN tokens whenever the speculative estimate is the slower
     // (low acceptance: sampling at high temperature, unpredictable text); the drafter's context follows the plain
     // tokens through the decode graph's feature ring.  The first PLAIN_PROBE tokens measure the plain mode.
-    constexpr int PLAIN_PROBE = 4, PLAIN_RUN = 32, SPEC_MIN = 3;
+    // tunables for tests: INK2_PLAIN_RUN (tokens decoded plain after a switch), INK2_SPEC_MIN (verify cycles before the first
+    // comparison), INK2_SPEC_MARGIN (speculate while ms_spec <= margin * ms_plain), INK2_SPEC_EST=old (mean of per-cycle ms / token)
+    constexpr int PLAIN_PROBE = 4;
+    const int PLAIN_RUN = std::getenv("INK2_PLAIN_RUN") ? std::atoi(std::getenv("INK2_PLAIN_RUN")) : 32;
+    const int SPEC_MIN = std::getenv("INK2_SPEC_MIN") ? std::atoi(std::getenv("INK2_SPEC_MIN")) : 3;
+    const double SPEC_MARGIN = std::getenv("INK2_SPEC_MARGIN") ? std::atof(std::getenv("INK2_SPEC_MARGIN")) : 1.0;
+    const bool est_old = std::getenv("INK2_SPEC_EST") && std::string(std::getenv("INK2_SPEC_EST")) == "old";
     const bool spec_force = std::getenv("INK2_SPEC_FORCE") != nullptr;   // tests: never fall back
     auto spec_continue = [&](int first, int p, int max_new, Sampler& s, const std::function<bool(int)>& emit,
                              const std::atomic<bool>* stop) {
         int n = 1, anchor = first, plain_left = spec_force ? 0 : PLAIN_PROBE, spec_iters = 0;
-        double ms_plain = 0.0, ms_spec = 0.0;   // EMA, ms per emitted token (0: not measured yet)
+        // ms per emitted token: plain = EMA of the step time; speculative = EMA(cycle time) / EMA(tokens per cycle), a ratio of means
+        // (averaging dt / (k + 1) per cycle over-weights the cycles that accepted little)
+        double ms_plain = 0.0, e_dt = 0.0, e_tok = 0.0, ms_spec = 0.0;
         bool go = true;
         while (go && n < max_new && !(stop && stop->load())) {
             if (plain_left > 0 || p + DBLK > E.ctx) {   // one token: decode graph, drafter context from its features
@@ -4321,11 +4329,17 @@ int main(int argc, char** argv) {
             D.accepted += k;
             ++D.hk[k];
             CK(cudaDeviceSynchronize());
-            const double dt = (now_ms() - t0) / (k + 1);
-            ms_spec = ms_spec > 0.0 ? 0.8 * ms_spec + 0.2 * dt : dt;
-            if (++spec_iters >= SPEC_MIN && ms_plain > 0.0 && ms_spec > ms_plain && !spec_force) {
+            const double dtc = now_ms() - t0;
+            if (est_old) {
+                ms_spec = ms_spec > 0.0 ? 0.8 * ms_spec + 0.2 * (dtc / (k + 1)) : dtc / (k + 1);
+            } else {
+                e_dt = e_dt > 0.0 ? 0.8 * e_dt + 0.2 * dtc : dtc;
+                e_tok = e_tok > 0.0 ? 0.8 * e_tok + 0.2 * (k + 1) : (k + 1);
+                ms_spec = e_dt / e_tok;
+            }
+            if (++spec_iters >= SPEC_MIN && ms_plain > 0.0 && ms_spec > SPEC_MARGIN * ms_plain && !spec_force) {
                 plain_left = PLAIN_RUN;
-                ms_spec = 0.0;
+                e_dt = e_tok = ms_spec = 0.0;
                 spec_iters = 0;
                 ++D.switches;
             }
