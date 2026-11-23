@@ -1,0 +1,4 @@
+req 0: prompt 10360 tokens, first token after 16.2 s, 245 tokens, 38.0 tok/s while decoding, done at +22.6 s
+req 1: prompt 7315 tokens, first token after 6.6 s, 246 tokens, 15.7 tok/s while decoding, done at +22.2 s
+all 2 decoding at once for 5.9 s: 441 tokens = 74.2 tok/s aggregate
+overall: 491 tokens in 22.6 s = 21.7 tok/s
