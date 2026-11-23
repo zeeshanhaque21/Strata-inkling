@@ -3882,6 +3882,7 @@ struct KvPoolT {
     double map_ms = 0.0;
     size_t used() const { return total - freeh.size(); }
 } g_kvp;
+std::function<bool(int)> g_kvp_evict;   // frees the least recently used idle sequence other than the argument; false: nothing to free (set by the serve loop)
 constexpr int KVP_MARGIN = 512;   // cells mapped beyond the last position: kernels load whole tiles and vectors before they mask
 double kvp_now() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 bool kvp_fit(int q, int cells) {   // false: the pool has no granule left (what was mapped stays)
@@ -3942,7 +3943,8 @@ void kv_fit(int need) {
 #if !defined(STRATA_USE_HIP)
     if (E.kvpool > 0) {   // the sequence being read or decoded (g_seq); a multi-sequence step maps its own (forward_ms)
         if (g_ms) return;
-        if (!kvp_fit(g_seq, need)) { std::fprintf(stderr, "kv-pool: full (sequence %d needs %d cells)\n", g_seq, need); std::exit(1); }
+        while (!kvp_fit(g_seq, need))
+            if (!g_kvp_evict || !g_kvp_evict(g_seq)) { std::fprintf(stderr, "kv-pool: full (sequence %d needs %d cells)\n", g_seq, need); std::exit(1); }
         return;
     }
 #endif
@@ -6125,7 +6127,8 @@ void forward_ms(const int* toks, const int* seqs, const int* pos, int n, bool co
 #if !defined(STRATA_USE_HIP)
     if (E.kvpool > 0)
         for (int i = 0; i < n; ++i)
-            if (!kvp_fit(seqs[i], pos[i] + 1)) { std::fprintf(stderr, "kv-pool: full (sequence %d at position %d)\n", seqs[i], pos[i]); std::exit(1); }
+            while (!kvp_fit(seqs[i], pos[i] + 1))
+                if (!g_kvp_evict || !g_kvp_evict(seqs[i])) { std::fprintf(stderr, "kv-pool: full (sequence %d at position %d)\n", seqs[i], pos[i]); std::exit(1); }
 #endif
     CK(cudaMemcpy(E.ms_seq, seqs, (size_t) n * 4, cudaMemcpyHostToDevice));
     CK(cudaMemcpy(E.ms_pos, pos, (size_t) n * 4, cudaMemcpyHostToDevice));
@@ -6430,6 +6433,10 @@ int main(int argc, char** argv) {
         else if (a == "--image-max-tokens") g_vis.max_tokens = std::atoi(v);
         else { std::fprintf(stderr, "unknown option %s\n", a.c_str()); return 2; }
     }
+    if (E.kvpool > 0 && E.kvpool < E.ctx) {
+        std::fprintf(stderr, "kv-pool: %ld tokens is less than the context %d: raised to the context (one sequence must be able to reach it)\n", E.kvpool, E.ctx);
+        E.kvpool = E.ctx;
+    }
     if (E.grow || E.kvpool > 0) vmm_init();
     if (dir.empty() || (ids.empty() && !serve && vis_pixels.empty())) {
         std::fprintf(stderr, "usage: strata-ink2 --model DIR (--serve | --tokens IDS | --tokens-file F) [--n N] [--ctx N] "
@@ -6672,6 +6679,7 @@ int main(int argc, char** argv) {
         reader.detach();
         std::printf("INFO images=%d\n", vis_available() ? 1 : 0);   // GEN takes image=<path> keys
         if (E.nseq > 1) std::printf("INFO batch_slots=%d\n", E.nseq);   // --slots N: BGEN / BT / BDONE (below)
+        if (E.kvpool > 0) std::printf("INFO kv_pool_tokens=%ld\n", E.kvpool);
         std::printf("READY %d stop\n", E.ctx);
         std::fflush(stdout);
         const int NSL = std::max(1, E.nseq);
@@ -6686,6 +6694,27 @@ int main(int argc, char** argv) {
         struct BSl { bool on = false; int cur = 0, pos = 0, max_gen = 0, gen = 0; bool ignore_eos = false; Sampler s; double t0 = 0.0;
                      std::vector<int> prompt, toks; };
         std::vector<BSl> bsl(NSL);
+        std::vector<uint64_t> last_use(NSL, 0);   // --kv-pool-tokens: which idle conversation to drop first
+        uint64_t use_clock = 0;
+        auto touch = [&](int k) { last_use[k] = ++use_clock; };
+#if !defined(STRATA_USE_HIP)
+        auto evict_one = [&](int keep1, int keep2) -> bool {   // the least recently used idle sequence that holds KV, other than keep1 / keep2
+            int v = -1;
+            for (int j = 0; j < NSL; ++j) {
+                if (j == keep1 || j == keep2 || bsl[j].on || g_kvp.arr.empty() || g_kvp.arr[0].h[j].empty()) continue;
+                if (v < 0 || last_use[j] < last_use[v]) v = j;
+            }
+            if (v < 0) return false;
+            const size_t held = shist[v].size();
+            if (v == 0 && g_sess.on && !ll_stale && !shist[0].empty()) sess_park(shist[0], last_logits);   // the solo conversation goes to host RAM first
+            kvp_trim(v, 0);
+            shist[v].clear();
+            if (v == 0) ll_stale = true;
+            std::fprintf(stderr, "kv-pool: evicted the conversation of sequence %d (%zu tokens) to make room; %zu of %zu granules mapped\n", v, held, g_kvp.used(), g_kvp.total);
+            return true;
+        };
+        if (E.kvpool > 0) g_kvp_evict = [&](int keep) { return evict_one(keep, -1); };
+#endif
         const bool interleave = !std::getenv("INK2_INTERLEAVE") || std::atoi(std::getenv("INK2_INTERLEAVE")) != 0;
         auto batch_active = [&] { int n = 0; for (const auto& b : bsl) n += b.on; return n; };
         auto slot_end = [&](int k, const char* finish) {
@@ -6698,6 +6727,7 @@ int main(int argc, char** argv) {
             b.toks.clear();
             b.prompt.clear();
             bstop[k].store(false);
+            touch(k);
         };
         auto batch_step = [&] {
             int ks[MS_MAX], toks[MS_MAX], pos[MS_MAX], am[MS_MAX], n = 0;
@@ -6706,7 +6736,11 @@ int main(int argc, char** argv) {
                 if (!bsl[k].on) continue;
                 if (bstop[k].load()) { slot_end(k, "cancel"); continue; }
 #if !defined(STRATA_USE_HIP)
-                if (E.kvpool > 0 && !kvp_fit(k, bsl[k].pos + 1)) { std::fprintf(stderr, "kv-pool: full, slot %d ends at %d tokens\n", k, bsl[k].pos); slot_end(k, "length"); continue; }
+                if (E.kvpool > 0) {
+                    bool fits = kvp_fit(k, bsl[k].pos + 1);
+                    while (!fits && evict_one(k, -1)) fits = kvp_fit(k, bsl[k].pos + 1);
+                    if (!fits) { std::fprintf(stderr, "kv-pool: full, slot %d ends at %d tokens\n", k, bsl[k].pos); slot_end(k, "length"); continue; }
+                }
 #endif
                 ks[n] = k; toks[n] = bsl[k].cur; pos[n] = bsl[k].pos; copy = copy || bsl[k].s.temp > 0.0f;
                 ++n;
@@ -6784,11 +6818,19 @@ int main(int argc, char** argv) {
             }
             if (k == 0 && !shist[0].empty() && own != shist[0].size() && !ll_stale && g_sess.on) sess_park(hist, last_logits);   // the solo conversation it overwrites
             bool room = true;   // --kv-pool-tokens: the sequence's share of the pool
-            if (src != k) room = seq_copy(k, src);
+            touch(k);
 #if !defined(STRATA_USE_HIP)
-            else if (E.kvpool > 0) kvp_trim(k, (int) best);
-            if (room && E.kvpool > 0) room = kvp_fit(k, (int) pr.size() + 1);
+            if (src != k) {
+                while (!(room = seq_copy(k, src)))
+                    if (!evict_one(k, src)) break;
+            } else if (E.kvpool > 0) kvp_trim(k, (int) best);
+            if (room && E.kvpool > 0) {
+                while (!(room = kvp_fit(k, (int) pr.size() + 1)))
+                    if (!evict_one(k, src)) break;
+            }
             if (!room) { kvp_trim(k, 0); kvp_report("refused a prompt"); }
+#else
+            if (src != k) room = seq_copy(k, src);
 #endif
             if (!room) { shist[k].clear(); err("BGEN: the KV pool is full (a prompt of " + std::to_string(pr.size()) + " tokens does not fit beside the other slots)"); return; }
             if (k == 0) ll_stale = true;
@@ -6904,6 +6946,20 @@ int main(int argc, char** argv) {
             size_t start = reuse ? hist.size() : 0;
             if (g_sess.on) start = sess_begin(pr, hist, last_logits, start);   // conversation cache (ink2_session.cuh)
             kv_trim((int) pr.size() + 1);
+            touch(0);
+#if !defined(STRATA_USE_HIP)
+            if (E.kvpool > 0) {   // the prompt's share of the pool, before it is read (idle conversations are dropped, least recently used first)
+                bool fits = kvp_fit(0, (int) pr.size() + 1);
+                while (!fits && evict_one(0, -1)) fits = kvp_fit(0, (int) pr.size() + 1);
+                if (!fits) {
+                    hist.clear();
+                    std::printf("ERR the KV pool is full: this prompt does not fit\n");
+                    std::fflush(stdout);
+                    smp.rng = std::move(s.rng);
+                    continue;
+                }
+            }
+#endif
             if ((spec || ll_stale) && start == pr.size()) start = pr.size() - 1;   // re-fed: the drafter needs its features (ll_stale: a slot went on in sequence 0)
             const double t0 = now_ms();
             const long acc0 = D.accepted, ver0 = D.verifies;
@@ -6974,6 +7030,7 @@ int main(int argc, char** argv) {
             if (!gen.empty()) hist.insert(hist.end(), gen.begin(), gen.end() - 1);   // the last token was never fed
             last_logits = logits;
             ll_stale = false;
+            touch(0);
             smp.rng = std::move(s.rng);
             // + drafts accepted / offered, prompt tokens not read (Strata's DONE fields 6-8: usage.cached_tokens)
             std::printf("DONE %zu %zu %.0f %.0f %s %ld %ld %zu\n", gen.size(), pr.size(), t1 - t0, t2 - t1, finish,

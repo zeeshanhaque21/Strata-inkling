@@ -824,11 +824,20 @@ def parallel_args(cfg: dict, args: list[str]) -> list[str]:
             args[args.index("--batch") + 1] = str(min(n, SPLIT_MAX_LANES))
         return []
     if os.path.basename(str(cfg.get("exe") or "").replace("\\", "/")).lower().startswith("strata-ink2"):
-        # strata-ink2 (the official Inkling checkpoint) runs one request at a time: it takes no batch flag
+        # strata-ink2 (the official Inkling checkpoint): "parallel": N asks for N batch slots (--slots, up to 8) that share one pool of K/V
+        # (--kv-pool-tokens: "kv_pool_tokens" in the config, else 1.5 contexts; a slot can still reach the whole context).  Slots and a pool
+        # in the saved args win.  1 or absent: one request at a time, as before.
+        if "--slots" in args or "--kv-pool-tokens" in args:
+            return []
         n = cfg.get("parallel")
-        if isinstance(n, int) and not isinstance(n, bool) and n > 1:
-            print(f'[strata] "parallel": {n} is ignored: strata-ink2 answers one request at a time', flush=True)
-        return []
+        if isinstance(n, bool) or not isinstance(n, int) or n <= 1:
+            return []
+        n = min(n, 8)
+        ctx = int(args[args.index("--max-context") + 1]) if "--max-context" in args[:-1] else 32768
+        pool = cfg.get("kv_pool_tokens")
+        if isinstance(pool, bool) or not isinstance(pool, int) or pool <= 0:
+            pool = min(n * ctx, ctx * 3 // 2)
+        return ["--slots", str(n), "--kv-pool-tokens", str(max(pool, ctx))]
     if cfg.get("arch") in ("inkling2_loop", "inkling2", "inkling2_loop_text"):
         # Inkling-2-Mini supports native 1..64 continuous batching (`--parallel 1|4|8|32|64`)!
         if "--parallel" in args or "--batch" in args or "--slots" in args:
