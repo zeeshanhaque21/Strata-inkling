@@ -3046,6 +3046,7 @@ struct Slot {
     int cap = 0;
     bool full = false;
     float *khist, *vhist, *ahist, *mhist;   // [HR][C]
+    int kvp_idx[4] = {-1, -1, -1, -1};      // --kv-pool-tokens: the index of each array in g_kvp (-1: an ordinary allocation)
     size_t seq_bytes[4] = {0, 0, 0, 0};     // multi-sequence decode (--slots N): the buffers hold N sequences back to back; bytes of one
                                             //   sequence's K, V, ksc, vsc (the histories: HR * C floats)
 };
@@ -3078,6 +3079,7 @@ struct Engine {
     Slot S[NCALLS];
     int* d_pos;
     int nseq = 1;                // --slots N: sequences held (N copies of every slot's buffers)
+    long kvpool = 0;             // --kv-pool-tokens N: the full slots' K/V of all sequences share a pool of N tokens of physical memory (virtual ranges, granules mapped on demand)
     int *ms_seq = nullptr, *ms_pos = nullptr;   // multi-sequence decode: token t's sequence and position (device, [MS_MAX])
     // activations
     float *h, *out, *Bbuf, *preB, *pre_h, *prev_stack, *msgs;
@@ -3864,7 +3866,86 @@ void pools_fill() {
     }
 }
 // the full slots hold `need` cells (grown in --kv-grow-step steps, from the expert pools when VRAM is short)
+// ---- --kv-pool-tokens N (CUDA only): every sequence keeps a contiguous virtual K/V range per full-attention array (the kernels address
+// base + seq * stride + pos * cell as before); the physical memory is one fixed pool of granules, mapped into a sequence's range as its
+// positions grow and given back when it is trimmed.  Nothing about the kernels changes.
+#if !defined(STRATA_USE_HIP)
+struct KvArr {
+    CUdeviceptr base = 0;
+    size_t stride = 0, bpc = 0;                                      // bytes of one sequence's range (granule multiple), bytes per cell
+    std::vector<std::vector<CUmemGenericAllocationHandle>> h;        // h[q]: the granules mapped from the start of sequence q's range
+};
+struct KvPoolT {
+    std::vector<KvArr> arr;
+    std::vector<CUmemGenericAllocationHandle> freeh;
+    size_t total = 0, maps = 0, unmaps = 0, peak = 0;
+    double map_ms = 0.0;
+    size_t used() const { return total - freeh.size(); }
+} g_kvp;
+constexpr int KVP_MARGIN = 512;   // cells mapped beyond the last position: kernels load whole tiles and vectors before they mask
+double kvp_now() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+bool kvp_fit(int q, int cells) {   // false: the pool has no granule left (what was mapped stays)
+    CUmemAccessDesc acc{};
+    acc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    acc.location.id = g_vmm.dev;
+    acc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    const double t0 = kvp_now();
+    for (auto& a : g_kvp.arr) {
+        const size_t want = std::min(a.stride, ((size_t) (cells + KVP_MARGIN) * a.bpc + g_vmm.gran - 1) / g_vmm.gran * g_vmm.gran) / g_vmm.gran;
+        auto& hq = a.h[q];
+        while (hq.size() < want) {
+            if (g_kvp.freeh.empty()) { g_kvp.map_ms += kvp_now() - t0; return false; }
+            const CUmemGenericAllocationHandle hd = g_kvp.freeh.back();
+            const CUdeviceptr at = a.base + (size_t) q * a.stride + hq.size() * g_vmm.gran;
+            if (g_vmm.map(at, g_vmm.gran, 0, hd, 0) != CUDA_SUCCESS || g_vmm.access(at, g_vmm.gran, &acc, 1) != CUDA_SUCCESS) {
+                std::fprintf(stderr, "kv-pool: cuMemMap failed\n");
+                std::exit(1);
+            }
+            g_kvp.freeh.pop_back();
+            hq.push_back(hd);
+            ++g_kvp.maps;
+        }
+    }
+    g_kvp.peak = std::max(g_kvp.peak, g_kvp.used());
+    g_kvp.map_ms += kvp_now() - t0;
+    return true;
+}
+// sequence q keeps `cells` cells (plus the margin); cells <= 0: nothing
+void kvp_trim(int q, int cells) {
+    bool any = false;
+    for (auto& a : g_kvp.arr) {
+        const size_t keep = cells <= 0 ? 0 : std::min(a.stride, ((size_t) (cells + KVP_MARGIN) * a.bpc + g_vmm.gran - 1) / g_vmm.gran * g_vmm.gran) / g_vmm.gran;
+        any = any || a.h[q].size() > keep;
+    }
+    if (!any) return;
+    CK(cudaDeviceSynchronize());   // (no kernel may still read what is unmapped)
+    const double t0 = kvp_now();
+    for (auto& a : g_kvp.arr) {
+        const size_t keep = cells <= 0 ? 0 : std::min(a.stride, ((size_t) (cells + KVP_MARGIN) * a.bpc + g_vmm.gran - 1) / g_vmm.gran * g_vmm.gran) / g_vmm.gran;
+        auto& hq = a.h[q];
+        while (hq.size() > keep) {
+            g_vmm.unmap(a.base + (size_t) q * a.stride + (hq.size() - 1) * g_vmm.gran, g_vmm.gran);
+            g_kvp.freeh.push_back(hq.back());
+            hq.pop_back();
+            ++g_kvp.unmaps;
+        }
+    }
+    g_kvp.map_ms += kvp_now() - t0;
+}
+void kvp_report(const char* what) {
+    std::fprintf(stderr, "kv-pool %s: %zu of %zu granules mapped (peak %zu, %.2f GiB of %.2f), %zu maps, %zu unmaps, %.1f ms in them\n", what, g_kvp.used(),
+                 g_kvp.total, g_kvp.peak, g_kvp.used() * g_vmm.gran / 1073741824.0, g_kvp.total * g_vmm.gran / 1073741824.0, g_kvp.maps, g_kvp.unmaps,
+                 g_kvp.map_ms);
+}
+#endif
 void kv_fit(int need) {
+#if !defined(STRATA_USE_HIP)
+    if (E.kvpool > 0) {   // the sequence being read or decoded (g_seq); a multi-sequence step maps its own (forward_ms)
+        if (g_ms) return;
+        if (!kvp_fit(g_seq, need)) { std::fprintf(stderr, "kv-pool: full (sequence %d needs %d cells)\n", g_seq, need); std::exit(1); }
+        return;
+    }
+#endif
     if (!E.grow || need <= E.kv_cells) return;
     const int nc = std::min(E.ctx, (need + E.grow_step - 1) / E.grow_step * E.grow_step);
     CK(cudaDeviceSynchronize());
@@ -3878,6 +3959,9 @@ void kv_fit(int need) {
 }
 // a request that needs only `need` cells: the rest of the mapped K/V back to the pools
 void kv_trim(int need) {
+#if !defined(STRATA_USE_HIP)
+    if (E.kvpool > 0) { kvp_trim(g_seq, need); return; }
+#endif
     if (!E.grow) return;
     const int nc = std::min(E.ctx, std::max(E.grow_step, (need + E.grow_step - 1) / E.grow_step * E.grow_step));
     if (E.kv_cells <= nc + E.grow_step) return;
@@ -3900,10 +3984,24 @@ void alloc_state() {
         void** arr[4] = {&S.K, &S.V, (void**) &S.ksc, (void**) &S.vsc};
         const int NS = std::max(1, E.nseq);
         if (NS > 1 && E.grow) { std::fprintf(stderr, "--slots N does not combine with --kv-grow\n"); std::exit(2); }
+        if (E.kvpool > 0 && E.grow) { std::fprintf(stderr, "--kv-pool-tokens does not combine with --kv-grow\n"); std::exit(2); }
         for (int a = 0; a < 4; ++a) {
             const size_t b = kv_cell_bytes(a);
             if (!b) continue;
             S.seq_bytes[a] = (size_t) S.cap * b;
+#if !defined(STRATA_USE_HIP)
+            if (E.kvpool > 0 && S.full) {
+                KvArr ka;
+                ka.bpc = b;
+                ka.stride = VRange::up((size_t) S.cap * b);
+                ka.h.resize(NS);
+                if (g_vmm.reserve(&ka.base, ka.stride * NS, 0, 0, 0) != CUDA_SUCCESS) { std::fprintf(stderr, "kv-pool: cuMemAddressReserve failed\n"); std::exit(1); }
+                S.seq_bytes[a] = ka.stride;
+                S.kvp_idx[a] = (int) g_kvp.arr.size();
+                *arr[a] = (void*) ka.base;
+                g_kvp.arr.push_back(std::move(ka));
+            } else
+#endif
             if (E.grow && S.full) {
                 g_kvr.emplace_back();
                 VRange& r = g_kvr.back();
@@ -3924,6 +4022,26 @@ void alloc_state() {
         for (size_t i = 0; i < g_kvr.size(); ++i)
             if (!g_kvr[i].map_to((size_t) E.kv_cells * g_kvr_bpc[i])) { std::fprintf(stderr, "--kv-grow: no VRAM for %d cells\n", E.kv_cells); std::exit(1); }
     }
+#if !defined(STRATA_USE_HIP)
+    if (E.kvpool > 0) {   // the physical pool: the tokens asked for, plus one granule per array and sequence (a scale array maps a whole granule)
+        size_t per_tok = 0;
+        for (auto& a : g_kvp.arr) per_tok += a.bpc;
+        const size_t ng = ((size_t) E.kvpool * per_tok + g_vmm.gran - 1) / g_vmm.gran + (size_t) std::max(1, E.nseq) * g_kvp.arr.size();
+        CUmemAllocationProp prop{};
+        prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+        prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        prop.location.id = g_vmm.dev;
+        for (size_t i = 0; i < ng; ++i) {
+            CUmemGenericAllocationHandle hd = 0;
+            if (g_vmm.create(&hd, g_vmm.gran, &prop, 0) != CUDA_SUCCESS) { std::fprintf(stderr, "kv-pool: out of VRAM at granule %zu of %zu\n", i, ng); std::exit(1); }
+            g_kvp.freeh.push_back(hd);
+        }
+        g_kvp.total = ng;
+        g_vram += ng * g_vmm.gran;
+        std::fprintf(stderr, "kv-pool: %ld tokens = %zu granules (%.2f GiB) for %zu arrays x %d sequences (%zu B per token), contexts up to %d\n", E.kvpool, ng,
+                     ng * g_vmm.gran / 1073741824.0, g_kvp.arr.size(), std::max(1, E.nseq), per_tok, E.ctx);
+    }
+#endif
     E.d_pos = (int*) dalloc(4);
     E.ms_seq = (int*) dalloc(MS_MAX * 4);
     E.ms_pos = (int*) dalloc(MS_MAX * 4);
@@ -6004,6 +6122,11 @@ void forward_prefill_device(int T, int pos0, float* all) {
 // one token for each of n (<= MS_MAX) sequences in a single forward: toks[i] at position pos[i] of sequence seqs[i].  The greedy
 // result of row i goes to am[i]; copy: every row's softcapped logits are in PF.rows_host too (sampling)
 void forward_ms(const int* toks, const int* seqs, const int* pos, int n, bool copy, int* am) {
+#if !defined(STRATA_USE_HIP)
+    if (E.kvpool > 0)
+        for (int i = 0; i < n; ++i)
+            if (!kvp_fit(seqs[i], pos[i] + 1)) { std::fprintf(stderr, "kv-pool: full (sequence %d at position %d)\n", seqs[i], pos[i]); std::exit(1); }
+#endif
     CK(cudaMemcpy(E.ms_seq, seqs, (size_t) n * 4, cudaMemcpyHostToDevice));
     CK(cudaMemcpy(E.ms_pos, pos, (size_t) n * 4, cudaMemcpyHostToDevice));
     g_ms = n;
@@ -6015,22 +6138,46 @@ void forward_ms(const int* toks, const int* seqs, const int* pos, int n, bool co
     CK(cudaMemcpy(am, PF.am, (size_t) n * 4, cudaMemcpyDeviceToHost));
 }
 // sequence src's whole state (K/V and scales of every layer application, the history rings) over sequence dst's
-void seq_copy(int dst, int src) {
+bool seq_copy(int dst, int src) {   // false: the KV pool has no room for dst
     CK(cudaStreamSynchronize(cudaStreamPerThread));
     auto cp = [&](void* d, const void* x, size_t b) { if (d && x && b) CK(cudaMemcpyAsync(d, x, b, cudaMemcpyDeviceToDevice, cudaStreamPerThread)); };
+    size_t nb[NCALLS][4];   // bytes to copy of each array: all of a plain allocation, the mapped granules of a pooled one
+    for (int s = 0; s < NCALLS; ++s)
+        for (int a = 0; a < 4; ++a) nb[s][a] = E.S[s].seq_bytes[a];
+#if !defined(STRATA_USE_HIP)
+    if (E.kvpool > 0) {
+        kvp_trim(dst, 0);
+        for (int s = 0; s < NCALLS; ++s)
+            for (int a = 0; a < 4; ++a)
+                if (E.S[s].kvp_idx[a] >= 0) {
+                    KvArr& ka = g_kvp.arr[E.S[s].kvp_idx[a]];
+                    nb[s][a] = ka.h[src].size() * g_vmm.gran;
+                }
+        // map dst as src is mapped (the arrays share the granule pool: all or nothing)
+        for (int s = 0; s < NCALLS; ++s)
+            for (int a = 0; a < 4; ++a)
+                if (E.S[s].kvp_idx[a] >= 0 && g_kvp.arr[E.S[s].kvp_idx[a]].h[dst].size() * g_vmm.gran < nb[s][a]) {
+                    // kvp_fit works in cells: ask for the cells that need this many granules in array a
+                    const KvArr& ka = g_kvp.arr[E.S[s].kvp_idx[a]];
+                    const int cells = (int) std::min<size_t>(nb[s][a] / ka.bpc, 1u << 30) - KVP_MARGIN;
+                    if (!kvp_fit(dst, std::max(cells, 0) + 0)) { kvp_trim(dst, 0); return false; }
+                }
+    }
+#endif
     for (int s = 0; s < NCALLS; ++s) {
         const Slot& S = E.S[s];
         const Slot a = seq_slot(S, dst), b = seq_slot(S, src);
-        cp(a.K, b.K, S.seq_bytes[0]);
-        cp(a.V, b.V, S.seq_bytes[1]);
-        cp(a.ksc, b.ksc, S.seq_bytes[2]);
-        cp(a.vsc, b.vsc, S.seq_bytes[3]);
+        cp(a.K, b.K, nb[s][0]);
+        cp(a.V, b.V, nb[s][1]);
+        cp(a.ksc, b.ksc, nb[s][2]);
+        cp(a.vsc, b.vsc, nb[s][3]);
         cp(a.khist, b.khist, (size_t) HR * KVD * 4);
         cp(a.vhist, b.vhist, (size_t) HR * KVD * 4);
         cp(a.ahist, b.ahist, (size_t) HR * H * 4);
         cp(a.mhist, b.mhist, (size_t) HR * H * 4);
     }
     CK(cudaStreamSynchronize(cudaStreamPerThread));
+    return true;
 }
 
 // ---- multi-sequence decode test (--ms-test a.ids,b.ids,... --slots N --n STEPS): B sequences prefilled into B slots, STEPS greedy
@@ -6107,7 +6254,13 @@ void ms_test(const std::vector<std::string>& files, int steps) {
         std::printf(" | first tokens:");
         for (int k = 0; k < std::min(steps, 8); ++k) std::printf(" %d", out_b[sq][k]);
         std::printf("\n");
+        unsigned long long hsh = 1469598103934665603ull;
+        for (int t : out_b[sq]) hsh = (hsh ^ (unsigned) t) * 1099511628211ull;
+        std::printf("tokens hash seq %d: %016llx\n", sq, hsh);
     }
+#if !defined(STRATA_USE_HIP)
+    if (E.kvpool > 0) kvp_report("after ms-test");
+#endif
     const double toks = (double) B * (steps - 1);
     std::printf("ms-test: %d sequences x %d steps: batched %.1f ms (%.1f tok/s aggregate, %.1f tok/s each, %.2f ms/step), "
                 "alone one after another %.1f ms (%.1f tok/s aggregate) -> %.2fx; %s\n",
@@ -6255,6 +6408,7 @@ int main(int argc, char** argv) {
         else if (a == "--kv-grow") E.grow = std::atoi(v) != 0;
         else if (a == "--conversation-cache-mib") cc_mib = std::atoi(v);
         else if (a == "--conversation-cache-min-tokens") cc_min = std::atoi(v);
+        else if (a == "--kv-pool-tokens") E.kvpool = std::atol(v);
         else if (a == "--kv-grow-step") E.grow_step = std::max(CHUNK, std::atoi(v) / CHUNK * CHUNK);
         else if (a == "--kv") {   // Strata's names too (strata_control/tuning.py: fp16, int8)
             const std::string k = v;
@@ -6276,7 +6430,7 @@ int main(int argc, char** argv) {
         else if (a == "--image-max-tokens") g_vis.max_tokens = std::atoi(v);
         else { std::fprintf(stderr, "unknown option %s\n", a.c_str()); return 2; }
     }
-    if (E.grow) vmm_init();
+    if (E.grow || E.kvpool > 0) vmm_init();
     if (dir.empty() || (ids.empty() && !serve && vis_pixels.empty())) {
         std::fprintf(stderr, "usage: strata-ink2 --model DIR (--serve | --tokens IDS | --tokens-file F) [--n N] [--ctx N] "
                              "[--chunk N] [--tc 0|1] [--verify-tc 0|1] [--kv f16|fp16|f32|i8|int8|i8r|k8v4|k8v8] [--kv-grow 1 [--kv-grow-step N]] [--vram-reserve-mib N [--cpu-threads N]] [--spec 0|1] [--dump-logits F] [--conversation-cache-mib N [--conversation-cache-min-tokens N]] [--image FILE ... [--image-max-tokens N] [--dump-image-emb F]] [--vis-pixels F]\n");
@@ -6551,6 +6705,9 @@ int main(int argc, char** argv) {
             for (int k = 0; k < NSL; ++k) {
                 if (!bsl[k].on) continue;
                 if (bstop[k].load()) { slot_end(k, "cancel"); continue; }
+#if !defined(STRATA_USE_HIP)
+                if (E.kvpool > 0 && !kvp_fit(k, bsl[k].pos + 1)) { std::fprintf(stderr, "kv-pool: full, slot %d ends at %d tokens\n", k, bsl[k].pos); slot_end(k, "length"); continue; }
+#endif
                 ks[n] = k; toks[n] = bsl[k].cur; pos[n] = bsl[k].pos; copy = copy || bsl[k].s.temp > 0.0f;
                 ++n;
             }
@@ -6626,8 +6783,14 @@ int main(int argc, char** argv) {
                 if (l > best + 256) { best = l; src = j; }
             }
             if (k == 0 && !shist[0].empty() && own != shist[0].size() && !ll_stale && g_sess.on) sess_park(hist, last_logits);   // the solo conversation it overwrites
-            if (src != k) seq_copy(k, src);
-            if (src == 0 && k != 0) { /* (the solo path keeps its state) */ }
+            bool room = true;   // --kv-pool-tokens: the sequence's share of the pool
+            if (src != k) room = seq_copy(k, src);
+#if !defined(STRATA_USE_HIP)
+            else if (E.kvpool > 0) kvp_trim(k, (int) best);
+            if (room && E.kvpool > 0) room = kvp_fit(k, (int) pr.size() + 1);
+            if (!room) { kvp_trim(k, 0); kvp_report("refused a prompt"); }
+#endif
+            if (!room) { shist[k].clear(); err("BGEN: the KV pool is full (a prompt of " + std::to_string(pr.size()) + " tokens does not fit beside the other slots)"); return; }
             if (k == 0) ll_stale = true;
             size_t start = std::min(best, pr.size() - 1);   // (a prompt the state holds whole: its last token is read again, for the logits)
             shist[k].assign(pr.begin(), pr.begin() + (long) best);
