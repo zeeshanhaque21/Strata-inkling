@@ -52,6 +52,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <array>
 #include <cstdio>
 #include <sstream>
 #include <fstream>
@@ -6000,6 +6001,38 @@ void forward_prefill_device(int T, int pos0, float* all) {
     }
 }
 
+// one token for each of n (<= MS_MAX) sequences in a single forward: toks[i] at position pos[i] of sequence seqs[i].  The greedy
+// result of row i goes to am[i]; copy: every row's softcapped logits are in PF.rows_host too (sampling)
+void forward_ms(const int* toks, const int* seqs, const int* pos, int n, bool copy, int* am) {
+    CK(cudaMemcpy(E.ms_seq, seqs, (size_t) n * 4, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(E.ms_pos, pos, (size_t) n * 4, cudaMemcpyHostToDevice));
+    g_ms = n;
+    PF.rows_argmax = true;
+    PF.rows_copy = copy;
+    forward_prefill(toks, n, 0, nullptr);
+    PF.rows_argmax = PF.rows_copy = false;
+    g_ms = 0;
+    CK(cudaMemcpy(am, PF.am, (size_t) n * 4, cudaMemcpyDeviceToHost));
+}
+// sequence src's whole state (K/V and scales of every layer application, the history rings) over sequence dst's
+void seq_copy(int dst, int src) {
+    CK(cudaStreamSynchronize(cudaStreamPerThread));
+    auto cp = [&](void* d, const void* x, size_t b) { if (d && x && b) CK(cudaMemcpyAsync(d, x, b, cudaMemcpyDeviceToDevice, cudaStreamPerThread)); };
+    for (int s = 0; s < NCALLS; ++s) {
+        const Slot& S = E.S[s];
+        const Slot a = seq_slot(S, dst), b = seq_slot(S, src);
+        cp(a.K, b.K, S.seq_bytes[0]);
+        cp(a.V, b.V, S.seq_bytes[1]);
+        cp(a.ksc, b.ksc, S.seq_bytes[2]);
+        cp(a.vsc, b.vsc, S.seq_bytes[3]);
+        cp(a.khist, b.khist, (size_t) HR * KVD * 4);
+        cp(a.vhist, b.vhist, (size_t) HR * KVD * 4);
+        cp(a.ahist, b.ahist, (size_t) HR * H * 4);
+        cp(a.mhist, b.mhist, (size_t) HR * H * 4);
+    }
+    CK(cudaStreamSynchronize(cudaStreamPerThread));
+}
+
 // ---- multi-sequence decode test (--ms-test a.ids,b.ids,... --slots N --n STEPS): B sequences prefilled into B slots, STEPS greedy
 // steps in lockstep (one token of each per forward), then each sequence again alone through the same path: every token must match.
 double now_ms();
@@ -6030,17 +6063,8 @@ void ms_test(const std::vector<std::string>& files, int steps) {
         return (int) (std::max_element(lg.begin(), lg.end()) - lg.begin());
     };
     auto step_ms = [&](const std::vector<int>& toks, const std::vector<int>& seqs, const std::vector<int>& pos) {
-        const int n = (int) toks.size();
-        CK(cudaMemcpy(E.ms_seq, seqs.data(), (size_t) n * 4, cudaMemcpyHostToDevice));
-        CK(cudaMemcpy(E.ms_pos, pos.data(), (size_t) n * 4, cudaMemcpyHostToDevice));
-        g_ms = n;
-        PF.rows_argmax = true;
-        PF.rows_copy = false;
-        forward_prefill(toks.data(), n, 0, nullptr);
-        PF.rows_argmax = false;
-        g_ms = 0;
-        std::vector<int> am((size_t) n);
-        CK(cudaMemcpy(am.data(), PF.am, (size_t) n * 4, cudaMemcpyDeviceToHost));
+        std::vector<int> am(toks.size());
+        forward_ms(toks.data(), seqs.data(), pos.data(), (int) toks.size(), false, am.data());
         return am;
     };
     // 1. lockstep
@@ -6318,6 +6342,9 @@ int main(int argc, char** argv) {
         PF.am = (int*) dalloc(DBLK * 4);
         CK(cudaHostAlloc((void**) &PF.rows_host, (size_t) DBLK * VOCAB * 4, cudaHostAllocDefault));
         g_fring = dfloats((size_t) FRING * 4 * H);
+    } else if (E.nseq > 1) {   // batch slots: the rows' argmax and (sampling) their logits
+        PF.am = (int*) dalloc(MS_MAX * 4);
+        CK(cudaHostAlloc((void**) &PF.rows_host, (size_t) MS_MAX * VOCAB * 4, cudaHostAllocDefault));
     }
     if (E.unembed.q && E.unembed.d && !std::getenv("INK2_KEEP_BF16")) {   // the drafter's fold above was the last reader of the BF16 copy
         CK(cudaFree(const_cast<uint16_t*>(E.unembed.d)));
@@ -6466,6 +6493,7 @@ int main(int argc, char** argv) {
         // T <id> per token; DONE <gen> <prompt> <prompt_ms> <decode_ms> <finish>; PP <read> <total> <ms> <tok/s>;
         // STOP (read by its own thread; cleared when the next GEN starts); EOF / QUIT ends.
         std::atomic<bool> stop{false};
+        std::array<std::atomic<bool>, MS_MAX> bstop{};   // BSTOP <slot>: read by the reader thread, taken at the slot's next step
         std::mutex mu;
         std::condition_variable cv;
         std::deque<std::string> q;
@@ -6475,6 +6503,12 @@ int main(int argc, char** argv) {
             while (std::getline(std::cin, line)) {
                 if (!line.empty() && line.back() == '\r') line.pop_back();
                 if (line == "STOP") { stop.store(true); continue; }
+                if (line.rfind("BSTOP ", 0) == 0) {
+                    const int k = std::atoi(line.c_str() + 6);
+                    if (k >= 0 && k < MS_MAX) bstop[k].store(true);
+                    continue;
+                }
+                if (line.rfind("BYIELD ", 0) == 0) continue;   // (a read that gives way to a shorter one: not supported, the read goes on)
                 { std::lock_guard<std::mutex> lk(mu); q.push_back(line); }
                 cv.notify_one();
             }
@@ -6483,22 +6517,185 @@ int main(int argc, char** argv) {
         });
         reader.detach();
         std::printf("INFO images=%d\n", vis_available() ? 1 : 0);   // GEN takes image=<path> keys
+        if (E.nseq > 1) std::printf("INFO batch_slots=%d\n", E.nseq);   // --slots N: BGEN / BT / BDONE (below)
         std::printf("READY %d stop\n", E.ctx);
         std::fflush(stdout);
-        std::vector<int> hist;   // tokens whose KV / conv state is in the slots; last_logits follow hist.back()
+        const int NSL = std::max(1, E.nseq);
+        std::vector<std::vector<int>> shist(NSL);   // the tokens whose state sits in each sequence (all but a decoding slot's)
+        std::vector<int>& hist = shist[0];   // tokens whose KV / conv state is in the slots; last_logits follow hist.back() (sequence 0: the solo path's)
         vec last_logits;
+        bool ll_stale = false;   // sequence 0 went on in a batch slot: last_logits no longer follow hist
         Sampler smp;
+        // ---- batch slots (--slots N).  BGEN <slot> <max_new> [keys] <ids> reads the prompt into sequence <slot> - from the longest
+        // matching state of any sequence (copied when it is another one's) - and prints PP lines, T <first token>, DONE and BADM <slot> 1/0.
+        // The slot then decodes together with the others, one token of each per forward: BT <slot> <id>, and BDONE <slot> <tokens> <finish> <ms>.
+        struct BSl { bool on = false; int cur = 0, pos = 0, max_gen = 0, gen = 0; bool ignore_eos = false; Sampler s; double t0 = 0.0;
+                     std::vector<int> prompt, toks; };
+        std::vector<BSl> bsl(NSL);
+        const bool interleave = !std::getenv("INK2_INTERLEAVE") || std::atoi(std::getenv("INK2_INTERLEAVE")) != 0;
+        auto batch_active = [&] { int n = 0; for (const auto& b : bsl) n += b.on; return n; };
+        auto slot_end = [&](int k, const char* finish) {
+            BSl& b = bsl[k];
+            shist[k] = b.prompt;   // the state holds the prompt and every token fed: all but the last one
+            if (!b.toks.empty()) shist[k].insert(shist[k].end(), b.toks.begin(), b.toks.end() - 1);
+            if (k == 0) ll_stale = true;
+            std::printf("BDONE %d %d %s %.0f\n", k, b.gen, finish, now_ms() - b.t0);
+            b.on = false;
+            b.toks.clear();
+            b.prompt.clear();
+            bstop[k].store(false);
+        };
+        auto batch_step = [&] {
+            int ks[MS_MAX], toks[MS_MAX], pos[MS_MAX], am[MS_MAX], n = 0;
+            bool copy = false;
+            for (int k = 0; k < NSL; ++k) {
+                if (!bsl[k].on) continue;
+                if (bstop[k].load()) { slot_end(k, "cancel"); continue; }
+                ks[n] = k; toks[n] = bsl[k].cur; pos[n] = bsl[k].pos; copy = copy || bsl[k].s.temp > 0.0f;
+                ++n;
+            }
+            if (n > 0) {
+                const int sq = g_seq;
+                g_seq = 0;
+                forward_ms(toks, ks, pos, n, copy, am);
+                g_seq = sq;
+                for (int i = 0; i < n; ++i) {
+                    BSl& b = bsl[ks[i]];
+                    const int next = b.s.temp > 0.0f ? sample(PF.rows_host + (size_t) i * VOCAB, b.s) : am[i];
+                    ++b.pos;
+                    b.cur = next;
+                    b.toks.push_back(next);
+                    ++b.gen;
+                    std::printf("BT %d %d\n", ks[i], next);
+                    if (next == EOS_ID && !b.ignore_eos) slot_end(ks[i], "stop");
+                    else if (b.gen >= b.max_gen) slot_end(ks[i], "length");
+                }
+            }
+            std::fflush(stdout);
+        };
+        auto run_slots_for = [&](double ms) {
+            const double end = now_ms() + ms;
+            do { if (!batch_active()) break; batch_step(); } while (now_ms() < end);
+        };
+        auto bgen = [&](const std::string& line) {
+            std::vector<std::string> f;
+            for (size_t p = 0; p < line.size();) {
+                const size_t s2 = line.find(' ', p);
+                f.push_back(line.substr(p, s2 == std::string::npos ? std::string::npos : s2 - p));
+                if (s2 == std::string::npos) break;
+                p = s2 + 1;
+            }
+            auto err = [&](const std::string& m) { std::printf("ERR %s\n", m.c_str()); std::fflush(stdout); };
+            if (f.size() < 4) { err("malformed BGEN"); return; }
+            const int k = std::atoi(f[1].c_str());
+            if (NSL < 2 || k < 0 || k >= NSL) { err("BGEN: no slot " + f[1]); return; }
+            if (bsl[k].on) { err("BGEN: slot " + f[1] + " is busy"); return; }
+            stop.store(false);
+            bstop[k].store(false);
+            int max_new = std::atoi(f[2].c_str());
+            std::vector<int> pr = parse_ids(f.back().c_str());
+            Sampler s;
+            bool ignore_eos = false;
+            for (size_t j = 3; j + 1 < f.size(); ++j) {   // unknown keys are ignored
+                const size_t eq = f[j].find('=');
+                if (eq == std::string::npos) continue;
+                const std::string key = f[j].substr(0, eq), val = f[j].substr(eq + 1);
+                if (key == "temperature") s.temp = std::strtof(val.c_str(), nullptr);
+                else if (key == "top_p") s.top_p = std::strtof(val.c_str(), nullptr);
+                else if (key == "top_k") s.top_k = std::atoi(val.c_str());
+                else if (key == "min_p") s.min_p = std::strtof(val.c_str(), nullptr);
+                else if (key == "seed") s.rng.seed(std::strtoull(val.c_str(), nullptr, 10));
+                else if (key == "ignore_eos") ignore_eos = std::atoi(val.c_str()) != 0;
+                else if (key == "image") { err("image: pictures run on the solo path only"); return; }
+            }
+            if (pr.empty()) { err("empty prompt"); return; }
+            if ((int) pr.size() >= E.ctx) { err("prompt of " + std::to_string(pr.size()) + " tokens exceeds the context " + std::to_string(E.ctx)); return; }
+            if (std::count(pr.begin(), pr.end(), IMAGE_TOKEN)) { err("image: pictures run on the solo path only"); return; }
+            max_new = std::max(0, std::min(max_new, E.ctx - (int) pr.size()));
+            // the state to start from: the longest history (of a sequence nobody is decoding in) that is a prefix of the prompt; another sequence's
+            // is copied when it saves more than a copy costs
+            auto prefix = [&](const std::vector<int>& h) -> size_t {
+                return !h.empty() && h.size() <= pr.size() && std::equal(h.begin(), h.end(), pr.begin()) ? h.size() : 0;
+            };
+            const size_t own = prefix(shist[k]);
+            size_t best = own;
+            int src = k;
+            for (int j = 0; j < NSL; ++j) {
+                if (j == k || bsl[j].on) continue;
+                const size_t l = prefix(shist[j]);
+                if (l > best + 256) { best = l; src = j; }
+            }
+            if (k == 0 && !shist[0].empty() && own != shist[0].size() && !ll_stale && g_sess.on) sess_park(hist, last_logits);   // the solo conversation it overwrites
+            if (src != k) seq_copy(k, src);
+            if (src == 0 && k != 0) { /* (the solo path keeps its state) */ }
+            if (k == 0) ll_stale = true;
+            size_t start = std::min(best, pr.size() - 1);   // (a prompt the state holds whole: its last token is read again, for the logits)
+            shist[k].assign(pr.begin(), pr.begin() + (long) best);
+            if (k == 0) { g_sess.live_prompt = 0; }
+            const double t0 = now_ms();
+            const int sq = g_seq;
+            g_seq = k;
+            bool aborted = false;
+            for (size_t p0 = start, Tz = 0; p0 < pr.size(); p0 += Tz) {
+                const int T = pf_fit((int) std::min((size_t) PF.TP, pr.size() - p0), (int) p0);
+                if (g_pf_full) { aborted = true; err("the context is full: this prompt does not fit with the batch slots"); break; }
+                Tz = (size_t) T;
+                if (T < g_pf_mapped_T) pf_unmap();
+                pf_map(T);
+                const double c0 = now_ms();
+                forward_prefill(&pr[p0], T, (int) p0, nullptr);
+                const double ms = now_ms() - t0;
+                std::printf("PP %zu %zu %.0f %.1f\n", p0 + T, pr.size(), ms, 1000.0 * (p0 + T - start) / std::max(ms, 1.0));
+                std::fflush(stdout);
+                if (p0 + T < pr.size()) {
+                    if (stop.load()) { aborted = true; break; }
+                    if (interleave && batch_active()) {   // the slots decode between the prompt's chunks: half as long as the chunk took
+                        g_seq = 0;
+                        run_slots_for(0.5 * (now_ms() - c0));
+                        g_seq = k;
+                    }
+                }
+            }
+            g_seq = sq;
+            if (aborted) {
+                pf_unmap();
+                shist[k].clear();
+                if (stop.load()) { std::printf("DONE 0 %zu %.0f 0 cancel 0 0 %zu\n", pr.size(), now_ms() - t0, start); std::printf("BADM %d 0\n", k); std::fflush(stdout); }
+                return;
+            }
+            CK(cudaMemcpy(logits.data(), E.logits, (size_t) VOCAB * 4, cudaMemcpyDeviceToHost));
+            pf_unmap();
+            const double t1 = now_ms();
+            const int first = max_new > 0 ? sample(logits, s) : 0;
+            if (max_new > 0) { std::printf("T %d\n", first); }
+            const bool eos = max_new > 0 && first == EOS_ID && !ignore_eos;
+            const bool go = max_new > 1 && !eos && !stop.load();
+            const char* fin = eos ? "stop" : (max_new > 1 && stop.load()) ? "cancel" : "length";
+            std::printf("DONE %d %zu %.0f %.0f %s 0 0 %zu\n", max_new > 0 ? 1 : 0, pr.size(), t1 - t0, now_ms() - t1, fin, start);
+            if (go) {
+                BSl& b = bsl[k];
+                b.on = true; b.cur = first; b.pos = (int) pr.size(); b.max_gen = max_new; b.gen = 1; b.ignore_eos = ignore_eos;
+                b.s = std::move(s); b.t0 = now_ms(); b.prompt = std::move(pr); b.toks.assign(1, first);
+            } else {
+                shist[k] = pr;   // the first token was never fed
+            }
+            std::printf("BADM %d %d\n", k, go ? 1 : 0);
+            std::fflush(stdout);
+        };
         for (;;) {
             std::string line;
+            bool have = false;
             {
                 std::unique_lock<std::mutex> lk(mu);
-                cv.wait(lk, [&] { return eof || !q.empty(); });
-                if (q.empty()) break;
-                line = q.front();
-                q.pop_front();
+                if (batch_active() == 0) cv.wait(lk, [&] { return eof || !q.empty(); });
+                if (!q.empty()) { line = q.front(); q.pop_front(); have = true; }
+                else if (eof) break;
             }
+            if (!have) { batch_step(); continue; }   // no command: the slots decode one token each
             if (line == "QUIT") break;
+            if (line.rfind("BGEN ", 0) == 0) { bgen(line); continue; }
             if (line.rfind("GEN ", 0) != 0) { std::printf("ERR unsupported command\n"); std::fflush(stdout); continue; }
+            while (batch_active()) batch_step();   // (the server sends GEN only when no slot is busy)
             stop.store(false);
             std::vector<std::string> f;
             for (size_t p = 0; p < line.size();) {
@@ -6544,7 +6741,7 @@ int main(int argc, char** argv) {
             size_t start = reuse ? hist.size() : 0;
             if (g_sess.on) start = sess_begin(pr, hist, last_logits, start);   // conversation cache (ink2_session.cuh)
             kv_trim((int) pr.size() + 1);
-            if (spec && start == pr.size()) start = pr.size() - 1;   // re-fed: the drafter needs its features
+            if ((spec || ll_stale) && start == pr.size()) start = pr.size() - 1;   // re-fed: the drafter needs its features (ll_stale: a slot went on in sequence 0)
             const double t0 = now_ms();
             const long acc0 = D.accepted, ver0 = D.verifies;
             if (const std::string ve = vis_encode(start); !ve.empty()) {
@@ -6613,6 +6810,7 @@ int main(int argc, char** argv) {
             g_vis.pending = false;
             if (!gen.empty()) hist.insert(hist.end(), gen.begin(), gen.end() - 1);   // the last token was never fed
             last_logits = logits;
+            ll_stale = false;
             smp.rng = std::move(s.rng);
             // + drafts accepted / offered, prompt tokens not read (Strata's DONE fields 6-8: usage.cached_tokens)
             std::printf("DONE %zu %zu %.0f %.0f %s %ld %ld %zu\n", gen.size(), pr.size(), t1 - t0, t2 - t1, finish,
