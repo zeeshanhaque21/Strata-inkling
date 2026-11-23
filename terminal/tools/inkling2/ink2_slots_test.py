@@ -148,17 +148,23 @@ def main():
         check(f"together slot {i} == alone", got == ref[i], f"{len(got)} tokens" + (f", first difference at {first}: {got[first]} vs {ref[i][first]}" if first is not None else ""))
     tot = sum(len(v) for v in out["toks"].values())
     print(f"  together: {tot} tokens, admissions {t_adm - t0:.1f} s, then {tot} tokens in {t1 - t_adm:.2f} s")
-    # 3. second turn in the same slot / 4. in another slot (state copied)
+    # 3. a second turn: cold (slot 0 wiped first), then the conversation again and its next turn in the same slot (history reused)
     p0 = prompts[0]
     turn2 = p0 + ref[0][:-1] + prompts[1][:40]
-    base, _, _ = gen_slot(e, 0, turn2, 24, ign)        # in slot 0: its history is p0 + ref[0][:-1] (a prefix)
-    same, reused_same, _ = gen_slot(e, 0, turn2 + [11, 12], 8, ign) if False else (None, None, None)
-    toks_a, reused_a, _ = gen_slot(e, 0, turn2, 24, ign)
-    check(f"turn 2 in slot 0 reuses the history ({reused_a} of {len(turn2)} read from the state)", reused_a is not None and reused_a >= len(p0) + n - 2 and toks_a == base)
-    toks_b, reused_b, _ = gen_slot(e, 2, turn2, 24, ign)   # slot 2 holds prompt 2: the copy from slot 0 / 1 is the longer match
-    check(f"turn 2 in another slot copies the state ({reused_b} reused)", reused_b is not None and reused_b >= len(p0) and toks_b == base,
-          "" if toks_b == base else f"tokens differ: {toks_b[:6]} vs {base[:6]}")
-    # fresh read of the same turn in a slot nothing matches: cold reference
+    gen_slot(e, 0, prompts[1][:300], 2, ign)                                  # slot 0 now holds something unrelated
+    cold, reused_cold, _ = gen_slot(e, 0, turn2, 24, ign)
+    check(f"turn 2 cold: {reused_cold} reused", reused_cold == 0)
+    gen_slot(e, 0, p0, n, ign)                                               # slot 0 holds p0 + its answer again
+    warm, reused_warm, _ = gen_slot(e, 0, turn2, 24, ign)
+    first = next((k for k in range(min(len(warm), len(cold))) if warm[k] != cold[k]), None)
+    check(f"turn 2 in the same slot reads only the new tokens ({reused_warm} of {len(turn2)} reused)", reused_warm == len(p0) + n - 1,
+          f"tokens {'equal to the cold read' if first is None else 'differ from the cold read at ' + str(first) + ' (chunking changes the arithmetic)'}")
+    # 4. its next turn in ANOTHER slot: the state is copied from slot 0
+    turn3 = turn2 + warm[:-1] + prompts[2][:30]
+    inplace_src_toks, reused_ip, _ = gen_slot(e, 2, turn3, 16, ign)           # slot 2 holds prompt 2: slot 0's state is the longer match -> copied
+    check(f"turn 3 in another slot copies the state ({reused_ip} of {len(turn3)} reused)", reused_ip == len(turn2) + len(warm) - 1)
+    same_slot, reused_s, _ = gen_slot(e, 0, turn3, 16, ign)                   # the same turn in place
+    check(f"turn 3 copied == turn 3 in place ({reused_s} reused in place)", same_slot == inplace_src_toks, f"{inplace_src_toks[:6]} vs {same_slot[:6]}")
     # 5. BSTOP
     out = {"toks": {}, "done": {}}
     for i in (0, 1):
