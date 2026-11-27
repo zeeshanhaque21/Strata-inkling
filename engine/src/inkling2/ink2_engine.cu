@@ -5209,6 +5209,8 @@ void upload_embed(int tok) {
 // the host-side pointer swaps are the same on every call (an even number), so a replay sees the same buffers.
 // --spec: the one-token path also keeps the drafter's features of its position, ring row pos % FRING
 constexpr int FRING = 16;
+// the drafter's three intermediate feature taps: the state entering layer visit 5 / 23 / 41 (+ INK2_TAPSHIFT, to test the DFlash 2 convention: the state after those visits)
+static const int g_tapshift = std::getenv("INK2_TAPSHIFT") ? std::atoi(std::getenv("INK2_TAPSHIFT")) : 0;
 float* g_fring = nullptr;   // [FRING][4][H]
 __global__ void k_feat_store(const float* __restrict__ x, float* __restrict__ ring, const int* __restrict__ d_pos, int tap) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -5220,8 +5222,8 @@ void forward_device() {
     int nB = 0, visit = 0;
     auto run = [&](int l, int slot, const float* msgs) {
         g_slot = slot;
-        if (g_fring && (visit == 5 || visit == 23 || visit == 41))
-            k_feat_store<<<H / 256, 256>>>(E.h, g_fring, E.d_pos, visit == 5 ? 0 : visit == 23 ? 1 : 2);
+        if (g_fring && (visit == 5 + g_tapshift || visit == 23 + g_tapshift || visit == 41 + g_tapshift))
+            k_feat_store<<<H / 256, 256>>>(E.h, g_fring, E.d_pos, visit == 5 + g_tapshift ? 0 : visit == 23 + g_tapshift ? 1 : 2);
         ++visit;
         layer_forward(l, E.S[slot], nB, msgs);
         if (l % BLOCK == 0) ++nB;
@@ -6495,7 +6497,15 @@ void df2_load(const std::string& dir) {
     D.on = true;
     std::fprintf(stderr, "drafter: DFlash 2 from %s (%d layers, FF %d, window %d%s%s)\n", dir.c_str(), D2L, D2FF, D2WIN, q8 ? ", int8 dense" : "", D2.embnorm ? ", embed norm" : "");
 }
+static const char* g_df2_dumpall = std::getenv("INK2_DF2_DUMPALL");   // append every context call (pos0, n, n x [4][H] features) to this file
 void df2_context(const float* feat, int pos0, int n) {
+    if (g_df2_dumpall) {
+        CK(cudaDeviceSynchronize());
+        std::vector<float> h((size_t) n * 4 * H);
+        CK(cudaMemcpy(h.data(), feat, h.size() * 4, cudaMemcpyDeviceToHost));
+        FILE* f = std::fopen(g_df2_dumpall, "ab");
+        if (f) { const int hd[2] = {pos0, n}; std::fwrite(hd, 4, 2, f); std::fwrite(h.data(), 4, h.size(), f); std::fclose(f); }
+    }
     if (g_df2_dump && g_df2_dump_ctx) {
         g_df2_dump_ctx = false;
         df2_dump("feat.bin", feat, (size_t) n * 4 * H * 4);
@@ -6694,6 +6704,16 @@ void draft_run(int tok, int p) {
     CK(cudaMemcpyAsync(D.drafts, &tok, 4, cudaMemcpyHostToDevice));
     static bool first_block = true;
     if (g_df2 && g_df2_dump && first_block) { first_block = false; g_df2_dump_blk = true; draft_device(p); return; }   // eager once, dumped
+    static const bool trace = std::getenv("INK2_DRAFT_TRACE") != nullptr;   // every block: its anchor position and token, then its 7 drafts (stderr)
+    if (trace) {
+        draft_device(p);
+        int d[DBLK];
+        CK(cudaMemcpy(d, D.drafts, DBLK * 4, cudaMemcpyDeviceToHost));
+        std::fprintf(stderr, "BLOCK p=%d tok=%d drafts", p, tok);
+        for (int i = 1; i < DBLK; ++i) std::fprintf(stderr, " %d", d[i]);
+        std::fprintf(stderr, "\n");
+        return;
+    }
     if (!E.graph) { draft_device(p); return; }
     CK(cudaMemcpyToSymbolAsync(d_vpos, &p, 4, 0, cudaMemcpyHostToDevice, cudaStreamPerThread));
     if (!g_draft_exec) {
@@ -6798,7 +6818,7 @@ void forward_prefill_device(int T, int pos0, float* all) {
     auto run = [&](int l, int slot, const float* msgs) {
         g_slot = slot;
         if (PF.feat) {
-            const int tap = visit == 5 ? 0 : visit == 23 ? 1 : visit == 41 ? 2 : -1;
+            const int tap = visit == 5 + g_tapshift ? 0 : visit == 23 + g_tapshift ? 1 : visit == 41 + g_tapshift ? 2 : -1;
             if (tap >= 0)
                 CK(cudaMemcpy2DAsync(PF.feat + (size_t) tap * H, (size_t) 4 * H * 4, PF.h, (size_t) H * 4, (size_t) H * 4,
                                      T, cudaMemcpyDeviceToDevice, cudaStreamPerThread));
