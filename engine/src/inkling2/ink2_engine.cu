@@ -588,13 +588,14 @@ __global__ void k_rms(const float* __restrict__ x, const float* __restrict__ w, 
 // S and NQ compile-time (registers only).  With `outn`, also outn[k] = rms(out[k]) * nw[k] (nw[k] null: unweighted);
 // `out` may then be null.
 constexpr int AR_T = 256, AR_C = H / AR_T;
-template <int S, int NQ>
-__global__ void k_attnres(const float* __restrict__ stack, size_t sstride, const float* __restrict__ queries,
-                          float* __restrict__ out, const float* nw0, const float* nw1, const float* nw2,
-                          float* __restrict__ outn) {
-    stack += (size_t) blockIdx.x * H;   // a grid of T tokens: stack entry j of token t at stack + j * sstride + t * H
-    if (out) out += (size_t) blockIdx.x * NQ * H;
-    if (outn) outn += (size_t) blockIdx.x * NQ * H;
+// COH: the stack was written by other blocks of this launch (fused kernels): read it through L2
+template <int S, int NQ, bool COH = false>
+__device__ __forceinline__ void attnres_body(const float* __restrict__ stack, size_t sstride, const float* __restrict__ queries,
+                                             float* __restrict__ out, const float* nw0, const float* nw1, const float* nw2,
+                                             float* __restrict__ outn, int tok) {
+    stack += (size_t) tok * H;   // a grid of T tokens: stack entry j of token t at stack + j * sstride + t * H
+    if (out) out += (size_t) tok * NQ * H;
+    if (outn) outn += (size_t) tok * NQ * H;
     constexpr int NV = S + NQ * S;
     __shared__ float red[AR_T / 32][NV + NQ];
     __shared__ float p[NQ][S], rinv[S], onorm[NQ];
@@ -611,7 +612,7 @@ __global__ void k_attnres(const float* __restrict__ stack, size_t sstride, const
         for (int k = 0; k < NQ; ++k) q[k] = queries[(size_t) k * H + i];
 #pragma unroll
         for (int j = 0; j < S; ++j) {
-            v[j][c] = stack[j * sstride + i];
+            v[j][c] = COH ? __ldcg(stack + j * sstride + i) : stack[j * sstride + i];
             acc[j] += v[j][c] * v[j][c];
 #pragma unroll
             for (int k = 0; k < NQ; ++k) acc[S + k * S + j] += q[k] * v[j][c];
@@ -680,6 +681,12 @@ __global__ void k_attnres(const float* __restrict__ stack, size_t sstride, const
             outn[(size_t) k * H + i] = wk ? wk[i] * (o[k][c] * onorm[k]) : o[k][c] * onorm[k];
         }
     }
+}
+template <int S, int NQ>
+__global__ void k_attnres(const float* __restrict__ stack, size_t sstride, const float* __restrict__ queries,
+                          float* __restrict__ out, const float* nw0, const float* nw1, const float* nw2,
+                          float* __restrict__ outn) {
+    attnres_body<S, NQ, false>(stack, sstride, queries, out, nw0, nw1, nw2, outn, blockIdx.x);
 }
 
 // rms of two vectors at once (blockIdx.x 0: x, 1: m), unweighted: gate j's [rms(x), rms(m)] into cat[j] [2H]
@@ -775,6 +782,32 @@ __global__ void k_attn_tail(const float* __restrict__ x, float* __restrict__ his
     const float v = boundary ? y : h[c] + y;
     r[c] = v;
     r_copy[c] = v;
+}
+// k_attn_tail and the attnres that follows it in one launch: the block that finishes last (a counter that resets itself) runs the attnres over the stack the tail blocks
+// just wrote.  Same arithmetic as the two launches.
+__device__ unsigned int g_tail_cnt;
+template <int S>
+__global__ void k_attn_tail_attnres(const float* __restrict__ x, float* __restrict__ hist, const float* __restrict__ w, const float* __restrict__ h,
+                                    float* __restrict__ r, float* __restrict__ r_copy, int boundary, const int* d_pos,
+                                    const float* __restrict__ stack, size_t sstride, const float* __restrict__ queries, float* __restrict__ out,
+                                    const float* nw0, float* __restrict__ outn) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c < H) {
+        const float y = short_conv1(x[c], hist, w, H, c, *d_pos);
+        const float v = boundary ? y : h[c] + y;
+        r[c] = v;
+        r_copy[c] = v;
+    }
+    __shared__ unsigned int last;
+    __threadfence();
+    __syncthreads();
+    if (!threadIdx.x) {
+        const unsigned int prev = atomicAdd(&g_tail_cnt, 1u);
+        last = prev == gridDim.x - 1;
+        if (last) g_tail_cnt = 0;   // every block has counted: ready for the next launch
+    }
+    __syncthreads();
+    if (last) attnres_body<S, 1, true>(stack, sstride, queries, out, nw0, nullptr, nullptr, outn, 0);
 }
 // MoE tail: combine the TOPK expert outputs, conv, residual: out = r + conv(sum_k y_k w_k)
 __global__ void k_moe_tail(const float* __restrict__ ey, const float* __restrict__ wts, float* __restrict__ hist,
@@ -933,7 +966,7 @@ __global__ void k_attn_prep(float* q, const float* q_scale, float* rs, const flo
 
 // partial attention: block (head h, chunk c) covers distances [c*CHUNK, c*CHUNK + CHUNK) back from pos; window 0 = full.
 // writes m, l (sum of exp) and o[HD] (unnormalized) for the merge.  block = 128 threads (4 warps).
-__global__ void k_attn_partial(const float* __restrict__ q, const void* __restrict__ K, const void* __restrict__ V,
+__device__ __forceinline__ void attn_partial_body(const float* __restrict__ q, const void* __restrict__ K, const void* __restrict__ V,
                                const __half* __restrict__ ksc, const __half* __restrict__ vsc, const float* __restrict__ rel, int cap, int window, const int* d_pos,
                                float* __restrict__ pm, float* __restrict__ pl, float* __restrict__ po) {
     __shared__ __align__(16) float qs[HD];
@@ -1016,24 +1049,52 @@ __global__ void k_attn_partial(const float* __restrict__ q, const void* __restri
     if (!tid) { pm[part] = mx; pl[part] = s; }
     po[part * HD + tid] = o;
 }
+__global__ void k_attn_partial(const float* __restrict__ q, const void* __restrict__ K, const void* __restrict__ V,
+                               const __half* __restrict__ ksc, const __half* __restrict__ vsc, const float* __restrict__ rel, int cap, int window, const int* d_pos,
+                               float* __restrict__ pm, float* __restrict__ pl, float* __restrict__ po) {
+    attn_partial_body(q, K, V, ksc, vsc, rel, cap, window, d_pos, pm, pl, po);
+}
 
 // merge the chunks of each head with its sink logit (zero value); out[h][HD]
-__global__ void k_attn_merge(const float* pm, const float* pl, const float* po, int nchunk, const float* sink,
-                             const float* gate, float* out) {
-    const int h = blockIdx.x, tid = threadIdx.x;
+template <bool COH>
+__device__ __forceinline__ void attn_merge_body(const float* pm, const float* pl, const float* po, int nchunk, const float* sink,
+                                                const float* gate, float* out, int h, int tid) {
+    auto ld = [](const float* p) { return COH ? __ldcg(p) : *p; };   // COH: the partials were written by other blocks of this launch
     float M = sink[h];
-    for (int c = 0; c < nchunk; ++c) M = fmaxf(M, pm[h * nchunk + c]);
+    for (int c = 0; c < nchunk; ++c) M = fmaxf(M, ld(pm + h * nchunk + c));
     float L = expf(sink[h] - M), o = 0.0f;
     for (int c = 0; c < nchunk; ++c) {
-        const float m = pm[h * nchunk + c];
+        const float m = ld(pm + h * nchunk + c);
         if (m == -INFINITY) continue;
         const float f = expf(m - M);
-        L += f * pl[h * nchunk + c];
-        o += f * po[((size_t) h * nchunk + c) * HD + tid];
+        L += f * ld(pl + h * nchunk + c);
+        o += f * ld(po + ((size_t) h * nchunk + c) * HD + tid);
     }
     float a = o / L;   // then the output gate: a * sigmoid(g)
     if (kv_rot_v(c_kvm)) a = wht128(a);   // rotated V: the output comes back with the same transform
     out[h * HD + tid] = a * (1.0f / (1.0f + expf(-gate[h * HD + tid])));
+}
+__global__ void k_attn_merge(const float* pm, const float* pl, const float* po, int nchunk, const float* sink,
+                             const float* gate, float* out) {
+    attn_merge_body<false>(pm, pl, po, nchunk, sink, gate, out, blockIdx.x, threadIdx.x);
+}
+// k_attn_partial and k_attn_merge in one launch: the chunk block of a head that finishes last merges that head (a per-head counter that resets itself)
+__device__ unsigned int g_merge_cnt[NQ];
+__global__ void k_attn_partial_merge(const float* __restrict__ q, const void* __restrict__ K, const void* __restrict__ V,
+                                     const __half* __restrict__ ksc, const __half* __restrict__ vsc, const float* __restrict__ rel, int cap, int window,
+                                     const int* d_pos, float* __restrict__ pm, float* __restrict__ pl, float* __restrict__ po,
+                                     const float* sink, const float* gate, float* out) {
+    attn_partial_body(q, K, V, ksc, vsc, rel, cap, window, d_pos, pm, pl, po);
+    __shared__ unsigned int last;
+    __threadfence();
+    __syncthreads();
+    if (!threadIdx.x) {
+        const unsigned int prev = atomicAdd(&g_merge_cnt[blockIdx.x], 1u);
+        last = prev == gridDim.y - 1;
+        if (last) g_merge_cnt[blockIdx.x] = 0;
+    }
+    __syncthreads();
+    if (last) attn_merge_body<true>(pm, pl, po, gridDim.y, sink, gate, out, blockIdx.x, threadIdx.x);
 }
 
 
@@ -1044,32 +1105,56 @@ __global__ void kb_wht(float* x, int stride) {
 }
 
 // router: sigmoid scores, top-8 on score + bias, weights score / sum * 8.  one block of NE threads
-__global__ void k_router(const float* logits, const float* bias, int* ids, float* wts) {
-    logits += (size_t) blockIdx.x * NE;
-    ids += blockIdx.x * TOPK;
-    wts += blockIdx.x * TOPK;
+// blockDim.x >= NE (threads beyond NE only take part in the barriers); COH: the logits were written by other blocks of this launch
+template <bool COH>
+__device__ __forceinline__ void router_body(const float* logits, const float* bias, int* ids, float* wts) {
     __shared__ float sel[NE], sc[NE];
     __shared__ int pick[TOPK];
     const int e = threadIdx.x;
-    sc[e] = 1.0f / (1.0f + expf(-logits[e]));
-    sel[e] = sc[e] + bias[e];
+    const bool act = e < NE;
+    if (act) {
+        sc[e] = 1.0f / (1.0f + expf(-(COH ? __ldcg(logits + e) : logits[e])));
+        sel[e] = sc[e] + bias[e];
+    }
     if (e < TOPK) pick[e] = e;   // only NaN scores leave a rank unfilled: keep the ids in range then
     __syncthreads();
     // rank of e = number of experts ahead of it (higher score, ties: lower index); ranks 0..TOPK-1 are the picks in
     // the order successive argmaxes (ties to the lowest index) would give them
-    const float me = sel[e];
-    int rank = 0;
-    for (int i = 0; i < NE; ++i) {
-        const float o = sel[i];
-        rank += (o > me) || (o == me && i < e);
+    if (act) {
+        const float me = sel[e];
+        int rank = 0;
+        for (int i = 0; i < NE; ++i) {
+            const float o = sel[i];
+            rank += (o > me) || (o == me && i < e);
+        }
+        if (rank < TOPK) pick[rank] = e;
     }
-    if (rank < TOPK) pick[rank] = e;
     __syncthreads();
     if (e == 0) {
         float sum = 0.0f;
         for (int k = 0; k < TOPK; ++k) sum += sc[pick[k]];
         for (int k = 0; k < TOPK; ++k) { ids[k] = pick[k]; wts[k] = sc[pick[k]] / (sum + 1e-20f) * ROUTE_SCALE; }
     }
+}
+__global__ void k_router(const float* logits, const float* bias, int* ids, float* wts) {
+    router_body<false>(logits + (size_t) blockIdx.x * NE, bias, ids + blockIdx.x * TOPK, wts + blockIdx.x * TOPK);
+}
+// k_gemv_bf16_rowblock (the NE router logits) and k_router in one launch: the block that finishes last routes
+__device__ unsigned int g_router_cnt;
+__global__ void k_gemv_router(const uint16_t* __restrict__ W, const float* __restrict__ x, float* __restrict__ logits, const float* bias, int* ids,
+                              float* wts, int K) {
+    const float acc = rowblock_dot(W, x, K);
+    if (!threadIdx.x) logits[blockIdx.x] = acc;
+    __shared__ unsigned int last;
+    __threadfence();
+    __syncthreads();
+    if (!threadIdx.x) {
+        const unsigned int prev = atomicAdd(&g_router_cnt, 1u);
+        last = prev == gridDim.x - 1;
+        if (last) g_router_cnt = 0;
+    }
+    __syncthreads();
+    if (last) router_body<true>(logits, bias, ids, wts);
 }
 
 
@@ -3015,6 +3100,8 @@ struct DMat {
 // tensor-core / int8 switches (env: INK2_Q8 mask, INK2_MMA, INK2_MMA_MOE, INK2_MMA_PLAIN)
 static const int g_q8 = std::getenv("INK2_Q8") ? std::atoi(std::getenv("INK2_Q8")) : 1;   // int8 dense weights, bit mask (0 = all BF16): 1 unembed, 2 wo, 4 proj, 8 the drafter's dense weights
 static const bool g_attn16 = !(std::getenv("INK2_ATTN16") && std::atoi(std::getenv("INK2_ATTN16")) == 0);
+// INK2_FUSE=0: the separate launches (attention partial / merge, router logits / top-k, attention tail / attnres) instead of the fused ones
+static const bool g_fuse = !(std::getenv("INK2_FUSE") && std::atoi(std::getenv("INK2_FUSE")) == 0);
 static const bool g_mma = !(std::getenv("INK2_MMA") && std::atoi(std::getenv("INK2_MMA")) == 0);
 static bool g_mma_moe = !(std::getenv("INK2_MMA_MOE") && std::atoi(std::getenv("INK2_MMA_MOE")) == 0);
 static bool g_mma_plain = !(std::getenv("INK2_MMA_PLAIN") && std::atoi(std::getenv("INK2_MMA_PLAIN")) == 0);
@@ -4178,8 +4265,12 @@ void attention(const Layer& Y, Slot& S, const float* xq, const float* xk, const 
         k_attn_prep<false><<<2 * NQ + NKV, 128>>>(q, Y.q_scale, rs, Y.rel_scale, Y.rel_proj, E.rel, 0, k, v, S.khist,
                                                  S.vhist, Y.k_conv, Y.v_conv, S.K, S.V, S.ksc, S.vsc, S.cap, E.d_pos);
     const int nch = S.full ? E.nchunk_full : E.nchunk_slide;
-    k_attn_partial<<<dim3(NQ, nch), 128>>>(q, S.K, S.V, S.ksc, S.vsc, E.rel, S.cap, S.full ? 0 : WINDOW, E.d_pos, E.pm, E.pl, E.po);
-    k_attn_merge<<<NQ, HD>>>(E.pm, E.pl, E.po, nch, sink, gate, E.att);
+    if (g_fuse) {
+        k_attn_partial_merge<<<dim3(NQ, nch), 128>>>(q, S.K, S.V, S.ksc, S.vsc, E.rel, S.cap, S.full ? 0 : WINDOW, E.d_pos, E.pm, E.pl, E.po, sink, gate, E.att);
+    } else {
+        k_attn_partial<<<dim3(NQ, nch), 128>>>(q, S.K, S.V, S.ksc, S.vsc, E.rel, S.cap, S.full ? 0 : WINDOW, E.d_pos, E.pm, E.pl, E.po);
+        k_attn_merge<<<NQ, HD>>>(E.pm, E.pl, E.po, nch, sink, gate, E.att);
+    }
     gemv(Y.wo, E.att, E.attn_out);
 }
 
@@ -4670,8 +4761,12 @@ void gg_sel(int t, const uint8_t* const* tab, size_t rb, const float* x, int xs,
 }
 
 void moe(const Layer& Y, const float* x, const float* r, float* mhist, const float* mlp_conv, float* out) {
-    k_gemv_bf16_rowblock<<<NE, 256>>>(Y.router.d, x, E.rl, H);
-    k_router<<<1, NE>>>(E.rl, Y.router_bias, E.ids, E.wts);
+    if (g_fuse) {
+        k_gemv_router<<<NE, 256>>>(Y.router.d, x, E.rl, Y.router_bias, E.ids, E.wts, H);
+    } else {
+        k_gemv_bf16_rowblock<<<NE, 256>>>(Y.router.d, x, E.rl, H);
+        k_router<<<1, NE>>>(E.rl, Y.router_bias, E.ids, E.wts);
+    }
     if (E.rec_mode == 1) k_rec_ids<<<1, TOPK>>>(E.ids, E.rec + (size_t) g_slot * E.ctx * TOPK, E.d_pos);
     if (E.cpu) expert_cpu_ring(int(&Y - E.L), x);
     else if (E.offload) expert_cache(int(&Y - E.L), E.ids, TOPK);
@@ -4750,19 +4845,29 @@ void layer_forward(int l, Slot& S, int nB, const float* msgs) {
     attention(Y, S, xq, xk, xv);
     int ns;
     const float* r;
-    if (l % BLOCK == 0) {   // block boundary: the residual restarts, B gains h (already at Bbuf[nB])
-        k_attn_tail<<<H / 256, 256>>>(E.attn_out, S.ahist, Y.attn_conv, E.h, E.att2, E.Bbuf + (size_t) (nB + 1) * H, 1, E.d_pos);
-        r = E.att2;
-        ns = nB + 2;
-    } else {
-        k_attn_tail<<<H / 256, 256>>>(E.attn_out, S.ahist, Y.attn_conv, E.h, E.r, stack_h, 0, E.d_pos);
-        r = E.r;
-        ns = nB + 1;
+    const bool boundary = l % BLOCK == 0;   // block boundary: the residual restarts, B gains h (already at Bbuf[nB])
+    float* const tr = boundary ? E.att2 : E.r;
+    float* const trc = boundary ? E.Bbuf + (size_t) (nB + 1) * H : stack_h;
+    r = tr;
+    ns = boundary ? nB + 2 : nB + 1;
+    bool fused = false;   // the tail and the attnres over the stack it completes: one launch
+    if (g_fuse) {
+        float* const ao = msgs ? E.m : nullptr;
+        const float* const aw = msgs ? nullptr : Y.mlp_norm;
+        float* const an = msgs ? nullptr : E.mn;
+        switch (ns) {
+#define TAIL_FUSED(SS) case SS: k_attn_tail_attnres<SS><<<H / 256, 256>>>(E.attn_out, S.ahist, Y.attn_conv, E.h, tr, trc, boundary ? 1 : 0, E.d_pos, \
+                                                                           E.Bbuf, (size_t) H, Y.mlp_query, ao, aw, an); fused = true; break;
+        TAIL_FUSED(2) TAIL_FUSED(3) TAIL_FUSED(4) TAIL_FUSED(5) TAIL_FUSED(6)
+#undef TAIL_FUSED
+        default: break;
+        }
     }
+    if (!fused) k_attn_tail<<<H / 256, 256>>>(E.attn_out, S.ahist, Y.attn_conv, E.h, tr, trc, boundary ? 1 : 0, E.d_pos);
     if (!msgs) {
-        attnres(E.Bbuf, ns, Y.mlp_query, 1, nullptr, Y.mlp_norm, nullptr, nullptr, E.mn);
+        if (!fused) attnres(E.Bbuf, ns, Y.mlp_query, 1, nullptr, Y.mlp_norm, nullptr, nullptr, E.mn);
     } else {
-        attnres(E.Bbuf, ns, Y.mlp_query, 1, E.m);
+        if (!fused) attnres(E.Bbuf, ns, Y.mlp_query, 1, E.m);
         const Gate* g1[1] = {&Y.gates[3]};
         const float* x1[1] = {E.m};
         const float* m1[1] = {msgs + 3 * H};
