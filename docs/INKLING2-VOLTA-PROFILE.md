@@ -150,6 +150,18 @@ Batched equals alone (`--ms-test`) for every sequence with QPN on, at 1, 2, 3, 4
 Tokens differ from the CUDA-core path after about 30 tokens (fp16 activations, fp32 accumulation, like the Turing tensor-core path).
 Engine kernel against the microbenchmark: a code-generation cliff cost the engine kernel 5 us (41 against 36 us) until the activation load and the launch bounds were both changed; any single change recovered it.
 
+### Speculative decoding with QPN (`--spec 1`, the model's own DSpark drafter, 300 tokens, greedy, 8192 context, V100 from a cool start)
+| prompt (tokens) | QPN, spec off | QPN, spec on | drafts accepted per verify | no QPN, spec on | no QPN, spec off |
+| --- | --- | --- | --- | --- | --- |
+| code, 5083 | 86.0 | **116.2** | 3.98 | 90.5 | 81.9 |
+| chat-code, 36 | 90.9 | **177.4** | 6.11 | 139.7 | 86.4 |
+| chat-qa, 33 | 91.0 | **138.0** | 4.62 | 71.5 (0.60 accepted) | 86.5 |
+| code, 700 | 87.5 | 85.9 | 2.15 | 79.2 | 83.3 |
+| prose, 2500 | 86.5 | 81.7 | 1.83 | 71.6 | 82.4 |
+- With QPN a verify (8 rows per expert) is nearly as cheap as a plain step, so speculation pays whenever acceptance is high: +27 to +28 % over the same prompts without QPN where the acceptance is the same (code, chat-code), and up to 177 tok/s.
+- Below about 2 accepted drafts per verify it does not pay at all (85.9 against 87.5, 81.7 against 86.5): the acceptance of the built-in drafter is now the limit, not the expert kernels.
+- The same prompt can accept very differently with and without QPN (chat-qa: 4.62 against 0.60 drafts per verify), because the fp16 activations change a near-tie in the greedy path; do not read a per-prompt acceptance as a property of the kernels.
+
 ## Tried, no gain (reverted)
 - launch-shape knobs `INK2_RPW`, `INK2_SEL_RPW`, `INK2_GEMV_MINB`: flat within noise (79 to 82);
 - unroll 3 of the expert GEMV loop: 80.2 (K = 1152 has 4.5 trips), unroll 3 for gate_up only: 82.0 against 82.5 although the microbenchmark gained 6.5 %;
