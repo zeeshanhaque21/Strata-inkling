@@ -209,6 +209,24 @@ So a cycle is about 90 % verify.  The batched-decode path does the same 8-token 
 **What follows.**  The dense int8 path (`k_mma_q8_multi`, Volta m16n8k8 emulated through m8n8k4) is the largest single cost of a verify (13.4 ms), of the draft step, and of batched decode (7.5 ms of a 4-sequence step).  A QPN8-style kernel (weights on the MMA N side, one shared fp16 activation fragment, weights repacked into fragment order, K split over warps; v100-skinny reaches 82 % of the read ceiling at M <= 8 for 8-bit weights) would take it to about the bandwidth floor: about 9 ms off a verify (about 20 % of a cycle), about 3.5 ms off the DFlash 2 draft step and about 4 ms off a 4-sequence batched step, with fp16 instead of int8 activations (more accurate).
 Then, in order of size: the verify attention through the batched-decode kernels (about 3 to 4 ms), the MXFP8 layers (about 2 ms), small-kernel fusion (about 3 ms at best).
 
+## Ninth round: dense int8 GEMVs on the tensor cores (branch `dense-w8`, `INK2_DQ8=1`, sm_70)
+`k_dq8` (tools/volta_bw/gemv_dq8.cu has the microbenchmark): the QPN2 mapping for int8 weights.  Weights on the MMA N side, one shared fp16 activation fragment (T <= 8 rows), weights repacked into fragment order, int8 -> fp16 exactly by a bias trick, the block scale folded in by one HMUL2 (its rounding to fp16 is 5e-4 relative per weight, below the int8 quantization), K split over 8 to 32 warps by the tile count.
+Microbenchmark, V100, 250 W: LM head 678 to 818 us (the emulated `k_mma_q8_multi`: 1,870 us), qkv / gate projection 35 us at 611 GB/s, `wo` 16 us, drafter down 36 us, 600 to 720 GB/s on the large shapes, error 2e-4 against fp64.
+In the engine it is a second, fragment-order copy of the int8 weights (about 2.4 GiB, built after `quantize_q8`, segment starts keep the projection's q / k / v slices addressable); T = 1 plain decode, the prefill dequant and every other reader still use the row-major copy.
+
+**Measured at a 120 W power limit** (the card's limit was found at 120 W instead of 250 W partway through the session, after the corpus runs; all runs below are interleaved from cool starts under that one cap, so they compare with each other, not with the 250 W numbers above; batched output equals alone in every run):
+| | DQ8 off | DQ8 on | |
+| --- | --- | --- | --- |
+| 1 sequence, batched path | 36.1 tok/s | 46.7 | +29 % |
+| 4 sequences | 108.5 | 130.8 | +21 % |
+| 8 sequences | 177.1 | 204.4 | +15 % |
+| DFlash 2 draft step | 5.6 ms | 2.8 ms | |
+| DSpark draft step | 4.7 ms | 2.9 ms | |
+| 8-token verify | 44.3 ms | 37.8 ms | |
+| speculative decode, 8 corpus prompts, mean | 87.7 tok/s | 100.9 | +15 % |
+The verify gained 6.5 ms of the 9 ms the profile promised: 3.8 ms of dense kernel time remain (148 calls), the verify attention (5 ms), the MXFP8 experts (3.5 ms), the router GEMVs (2.4 ms) and the small kernels are untouched.  Mean acceptance moves from 3.75 to 3.50 accepted per verify (fp16 instead of int8 activations changes the greedy path; the text differs on 5 of 8 prompts).
+Next: drop the row-major copy (T = 1 qkv, the prefill dequant), route T = 1 through the same kernel, then the verify attention.
+
 ## Tried, no gain (reverted)
 - launch-shape knobs `INK2_RPW`, `INK2_SEL_RPW`, `INK2_GEMV_MINB`: flat within noise (79 to 82);
 - unroll 3 of the expert GEMV loop: 80.2 (K = 1152 has 4.5 trips), unroll 3 for gate_up only: 82.0 against 82.5 although the microbenchmark gained 6.5 %;
