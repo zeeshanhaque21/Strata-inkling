@@ -89,6 +89,34 @@ Both were measured in microbenchmarks (`tools/volta_bw/gemv_steps.cu`, `gemv_dec
 - A tensor-core path would also need fp16 activations (the engine keeps fp32 here), so it changes the numerics, and on Volta the m8n8k4 fragments waste 7/8 of the columns of a single-token GEMV.  Not worth building.
 - The load pieces cost more than the arithmetic: scale loads alone add 3.8 us (29.6 to 33.4), x loads 1 us.  A different scale layout (e.g. one word per lane per four trips) is the one remaining bit-identical idea, worth at most 1 to 2 % of the step.
 
+## Fourth round: batched decode (V100, `--ms-test`, 4096 context, k8v4, same 0222-based volta10 build)
+**Scaling.**  Step time of the batched path (ms per step) and aggregate tok/s:
+
+| sequences | 1 | 2 | 3 | 4 |
+| --- | --- | --- | --- | --- |
+| ms per step | 21.6 | 26.5 | 30.7 | 34.7 |
+| aggregate tok/s | 46.4 | 75.5 | 97.7 | 115.2 |
+
+Each extra sequence costs 4.0 to 4.9 ms (its eight experts per layer application), on top of a fixed 17.6 ms.  The single-stream path takes 12.1 ms, so the multi-sequence path carries about 5.5 ms of fixed overhead the plain path does not have.
+
+**Where a 4-sequence step goes (nsys, `msreg3.py`, 63 steps, 38.1 ms per step including some prefill in the window).**  `k_moe_gemv_grp` (CUDA-core grouped experts) 18.2 ms (48 %), `k_mma_q8_multi` (dense int8, emulated tensor core) 7.5 ms (20 %), attention partial 1.6 ms, the rest are small kernels of 0.2 to 1 ms each.  The run is 94.6 % kernel time.
+At 4 sequences about 29 distinct experts are read per layer application (28 to 29 expected for 4 x top-8 of 128), 3.5x the bytes of one sequence, at about 430 GB/s: the MoE part is bound by the distinct-expert bytes.
+
+**A native Volta tensor-core expert kernel (`tools/volta_bw/gemv_tc.cu`, gate_up, 8 experts, 24 MB).**  Weights repacked once into a warp-contiguous layout, e2m1 decoded straight into the `mma.m8n8k4` A fragment with the block scale folded in by one HMUL2 (exact in fp16), fp16 activations, fp32 accumulate in Volta's D layout:
+| tokens per expert | CUDA cores (engine shape) | tensor core, native layout |
+| --- | --- | --- |
+| 1 | 47.5 us | 48.7 us |
+| 2 | 55.7 | 49.3 |
+| 4 | 89.7 | 50.3 |
+| 8 | 142.8 | 52.1 |
+Max relative error against a double-precision reference with fp16-rounded x: 5e-7.  Two bugs cost most of the time and are worth remembering: an eight-way shared-memory bank conflict from a power-of-two token row stride (148 to 75 us), and one-lane-per-row global loads at half-sector efficiency (75 to 50 us, fixed by the repack).
+- The kernel pays off when many tokens share an expert: prefill, speculative verification of long drafts, and batches well past the 8-slot limit.  At 4 sequences the average expert is chosen by about 1.1 tokens, where the two kernels tie, so it does **not** speed up batched decode.
+- Batched decode on this card is therefore limited by distinct-expert bytes (about 4 ms per sequence) and, beyond that, by the 5.5 ms fixed overhead.
+
+**What is left for batched decode.**
+- The fixed overhead: `k_mma_q8_multi` (7.5 ms against about 5 ms for the single-stream int8 GEMVs) and the multi-sequence small kernels.  A native-layout dense int8 kernel built like the one above is the candidate: about 3 ms of a 35 ms step (about 9 %) at 4 sequences, more at 2 to 3 where the fixed part dominates.
+- Nothing cheap on the expert side: the bytes are what they are.
+
 ## Tried, no gain (reverted)
 - launch-shape knobs `INK2_RPW`, `INK2_SEL_RPW`, `INK2_GEMV_MINB`: flat within noise (79 to 82);
 - unroll 3 of the expert GEMV loop: 80.2 (K = 1152 has 4.5 trips), unroll 3 for gate_up only: 82.0 against 82.5 although the microbenchmark gained 6.5 %;
