@@ -308,6 +308,110 @@ __global__ void k_gemv_nvfp4_sel(const uint8_t* const* __restrict__ tab,
             if (row0 + r + 1 < N) act[(size_t) blockIdx.y * (N / 2) + (row0 + r) / 2] = swiglu1(t[r], t[r + 1]);
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// Volta QPN2 experts (INK2_QPN=1, sm_70 only).  The design (weights on the N side of mma.m8n8k4, the four quad-pairs sharing one activation fragment, weights prepacked
+// into fragment order so the decoder's half2 output is the B fragment, no shared memory in the main loop, K split over warps) is v100-skinny's QPN2 by Dennis Vertzyas
+// (MIT, github.com/dnv2003/v100-skinny; decoder derived from TurboMind, Apache-2.0).  Measured in tools/volta_bw/gemv_qpn.cu: 36 us against 47.5 us for k_gemv_nvfp4_sel
+// on a V100 (gate_up, 8 experts), 2e-7 against a double-precision reference.  Activations enter as fp16 (fp32 accumulate), like the Turing tensor-core path.
+// Layout of a QPN matrix (same bytes as the checkpoint's: N * K / 2 codes then N * K / 16 scales): codes [N / 32 tile][K / 16 group][32 lane] x 8 B, scales [tile][group][lane] x 1 B;
+// lane (quad-pair q = lane >> 2 & 3, p = lane & 3 | lane & 16 >> 2) holds column 8 q + p of the tile; the 16 nibbles of its group are in k order 0 2 4 6 1 3 5 7 8 10 12 14 9 11 13 15.
+__device__ __forceinline__ half2 qpn_e4m3_half2(unsigned char b) {
+    const unsigned short hb = (((unsigned short) b & 0x80u) << 8) | (((unsigned short) b & 0x7Fu) << 7);
+    const __half hs = __hmul(__ushort_as_half(hb), __ushort_as_half(0x5C00));   // * 256
+    return __halves2half2(hs, hs);
+}
+__device__ __forceinline__ void qpn_dequant8(unsigned q, half2 sc2, half2 out[4]) {   // 8 nibbles -> {code i, code i + 4} x scale; values carry 2^-14 (folded into the scale by the caller)
+    constexpr unsigned S = 0x80008000u, EM = 0x0E000E00u;
+    const unsigned v0 = ((q << 12) & S) | ((q << 9) & EM), v1 = ((q << 8) & S) | ((q << 5) & EM), v2 = ((q << 4) & S) | ((q << 1) & EM), v3 = (q & S) | ((q >> 3) & EM);
+    out[0] = __hmul2(*reinterpret_cast<const half2*>(&v0), sc2); out[1] = __hmul2(*reinterpret_cast<const half2*>(&v1), sc2);
+    out[2] = __hmul2(*reinterpret_cast<const half2*>(&v2), sc2); out[3] = __hmul2(*reinterpret_cast<const half2*>(&v3), sc2);
+}
+__global__ void k_f2h(const float* __restrict__ x, __half* __restrict__ y, int n) { const int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) y[i] = __float2half(x[i]); }
+// one matrix [N][K / 2] codes + [N][K / 16] scales (checkpoint order) -> QPN order; thread per (tile, group, lane)
+__global__ void k_qpn_repack(const uint8_t* __restrict__ src, uint8_t* __restrict__ dst, int N, int K) {
+    const int G = K >> 4;
+    const size_t idx = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (size_t) (N / 32) * G * 32) return;
+    const int lane = (int) (idx & 31);
+    const size_t tg = idx >> 5;
+    const int g = (int) (tg % G), tile = (int) (tg / G);
+    const int col = tile * 32 + ((lane >> 2) & 3) * 8 + (lane & 3) + ((lane & 16) ? 4 : 0);
+    const uint2 w = *reinterpret_cast<const uint2*>(src + (size_t) col * (K / 2) + (size_t) g * 8);
+    const uint8_t* bp = reinterpret_cast<const uint8_t*>(&w);
+    constexpr int ko[16] = {0, 2, 4, 6, 1, 3, 5, 7, 8, 10, 12, 14, 9, 11, 13, 15};
+    unsigned o[2] = {0u, 0u};
+#pragma unroll
+    for (int b = 0; b < 8; ++b) {
+        const int k0 = ko[2 * b], k1 = ko[2 * b + 1];
+        const unsigned n0 = (k0 & 1) ? bp[k0 >> 1] >> 4 : bp[k0 >> 1] & 15u, n1 = (k1 & 1) ? bp[k1 >> 1] >> 4 : bp[k1 >> 1] & 15u;
+        o[b >> 2] |= (n0 | (n1 << 4)) << (8 * (b & 3));
+    }
+    *reinterpret_cast<uint2*>(dst + idx * 8) = make_uint2(o[0], o[1]);
+    dst[(size_t) N * (K / 2) + idx] = src[(size_t) N * (K / 2) + (size_t) col * G + g];
+}
+// The TOPK selected experts, one token each (blockIdx.y = k): y[k][col] = factors[e] * W_e[col] . x_k, e = ids[k]; block = tile of 32 columns, SPLITK warps split K.
+// GU: columns 2j / 2j + 1 are gate j / up j: also act[k][j] = swiglu(gate, up) (the down GEMV's input), as k_gemv_nvfp4_sel does, and act16 as fp16 for it.
+// x is fp16 (x_stride in halves).  The expert's global factor goes into the half2 scale (factor * 2^14 * e4m3 stays in fp16 range for the checkpoint's factors; folding it after the
+// fp32 sum instead overflows: a block scale can be 448).
+template <int SPLITK, bool GU>
+__global__ void k_qpn_sel(const uint8_t* const* __restrict__ tab, const float* __restrict__ factors, const int* __restrict__ ids,
+                                                         const __half* __restrict__ x, int x_stride, float* __restrict__ y, int N, int K, float* __restrict__ act,
+                                                         __half* __restrict__ act16) {
+    __shared__ float cs[SPLITK][32];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, tile = blockIdx.x, kk = blockIdx.y;
+    const int e = ids[kk];
+    const uint8_t* W = tab[e];
+    if (!W) return;
+    const int qp = (lane >> 2) & 3, r = (lane & 3) + ((lane & 16) ? 4 : 0), G = K >> 4, Gq = G / SPLITK, g0 = warp * Gq;
+    const uint2* cb = reinterpret_cast<const uint2*>(W) + (size_t) tile * G * 32 + lane;
+    const uint8_t* sb = W + (size_t) N * (K / 2) + (size_t) tile * G * 32 + lane;
+    const __half* xk = x + (size_t) kk * x_stride;
+    const half2 gm2 = __float2half2_rn(factors[e] * 16384.0f);
+    float c[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) c[i] = 0.0f;
+#pragma unroll 4
+    for (int g = g0; g < g0 + Gq; ++g) {
+        const uint2 q2 = __ldcs(cb + (size_t) g * 32);
+        const half2 sc2 = __hmul2(qpn_e4m3_half2(__ldg(sb + (size_t) g * 32)), gm2);
+        half2 b[8];
+        qpn_dequant8(q2.x, sc2, b + 0);
+        qpn_dequant8(q2.y, sc2, b + 4);
+        const unsigned* B = reinterpret_cast<const unsigned*>(b);
+        uint4 a01 = make_uint4(0, 0, 0, 0), a23 = make_uint4(0, 0, 0, 0);
+        if (r == 0) {   // one token: only matrix row 0 of the A fragment is real
+            a01 = *reinterpret_cast<const uint4*>(xk + g * 16);   // plain loads: with __ldg and launch bounds together this kernel fell to 41 us from 36 us (microbenchmark, tools/volta_bw/gemv_qpn.cu)
+            a23 = *reinterpret_cast<const uint4*>(xk + g * 16 + 8);
+        }
+        asm volatile("mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 {%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, {%0,%1,%2,%3,%4,%5,%6,%7};\n"
+                     : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]), "+f"(c[4]), "+f"(c[5]), "+f"(c[6]), "+f"(c[7]) : "r"(a01.x), "r"(a01.y), "r"(B[0]), "r"(B[1]));
+        asm volatile("mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 {%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, {%0,%1,%2,%3,%4,%5,%6,%7};\n"
+                     : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]), "+f"(c[4]), "+f"(c[5]), "+f"(c[6]), "+f"(c[7]) : "r"(a01.z), "r"(a01.w), "r"(B[2]), "r"(B[3]));
+        asm volatile("mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 {%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, {%0,%1,%2,%3,%4,%5,%6,%7};\n"
+                     : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]), "+f"(c[4]), "+f"(c[5]), "+f"(c[6]), "+f"(c[7]) : "r"(a23.x), "r"(a23.y), "r"(B[4]), "r"(B[5]));
+        asm volatile("mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 {%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, {%0,%1,%2,%3,%4,%5,%6,%7};\n"
+                     : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]), "+f"(c[4]), "+f"(c[5]), "+f"(c[6]), "+f"(c[7]) : "r"(a23.z), "r"(a23.w), "r"(B[6]), "r"(B[7]));
+    }
+    // accumulator i of this lane: matrix row (i & 2) | (lane & 16 ? 4 : 0) | (lane & 1), column (i & 1) | ((lane >> 1 & 1) << 1) | ((i >> 2) << 2) of quad-pair qp's 8 columns
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int row = (i & 2) | ((lane & 16) ? 4 : 0) | (lane & 1);
+        if (row == 0) cs[warp][qp * 8 + ((i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2))] = c[i];
+    }
+    __syncthreads();
+    if (warp == 0) {
+        float v = 0.0f;
+#pragma unroll
+        for (int w = 0; w < SPLITK; ++w) v += cs[w][lane];
+        const int col = tile * 32 + lane;
+        y[(size_t) kk * N + col] = v;
+        if (GU) {
+            const float u = __shfl_down_sync(0xffffffffu, v, 1);
+            if (!(lane & 1)) { const float a = swiglu1(v, u); act[(size_t) kk * (N / 2) + col / 2] = a; act16[(size_t) kk * (N / 2) + col / 2] = __float2half(a); }
+        }
+    }
+}
+
 // MXFP8: lane reads 4 bytes = 4 columns; the ue8m0 exponent per 32 columns (8 words): 2^(s - 127) * 2^8
 template <int R, bool SWI = false>
 __global__ void k_gemv_mxfp8_sel(const uint8_t* const* __restrict__ tab, const int* __restrict__ ids, const float* __restrict__ x, int x_stride,
@@ -2203,6 +2307,63 @@ __global__ void __launch_bounds__(256, GRP_MINB) k_moe_gemv_grp(const float* __r
     }
 }
 
+// Volta QPN2 grouped experts (INK2_QPN=1): k_moe_gemv_grp's job for NVFP4 layers on the fragment-order copy.  Block (tile of 32 columns, plan tile blockIdx.y): the plan tile's up to
+// SMALL_T = 8 rows are the 8 rows of the mma.m8n8k4 activation fragment, so every row of an expert is served by one pass over its weights; K is split over SPLITK warps.
+// A is fp16 [rows][lda] (rows[r0 + t] picks the row, null: row r0 + t); C[(r0 + t) * N + col] as k_moe_gemv_grp writes it.  The expert's factor is folded into the half2 scale.
+template <int SPLITK>
+__global__ void k_qpn_grp(const __half* __restrict__ A, int lda, const int* __restrict__ rows, const uint8_t* const* __restrict__ tab, const float* __restrict__ factors,
+                          const int* __restrict__ tile_e, const int* __restrict__ tile_r0, const int* __restrict__ ntiles, const int* __restrict__ eoff,
+                          const int* __restrict__ ecnt, float* __restrict__ C, int N, int K) {
+    __shared__ float cs[SPLITK][256];
+    if ((int) blockIdx.y >= *ntiles) return;
+    const int e = tile_e[blockIdx.y], r0 = tile_r0[blockIdx.y], nr = min(eoff[e] + ecnt[e] - r0, SMALL_T);
+    const uint8_t* W = tab[e];
+    if (!W) return;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, tile = blockIdx.x;
+    const int qp = (lane >> 2) & 3, r = (lane & 3) + ((lane & 16) ? 4 : 0), G = K >> 4, Gq = G / SPLITK, g0 = warp * Gq;
+    const uint2* cb = reinterpret_cast<const uint2*>(W) + (size_t) tile * G * 32 + lane;
+    const uint8_t* sb = W + (size_t) N * (K / 2) + (size_t) tile * G * 32 + lane;
+    const __half* xrow = A + (size_t) (rows ? rows[r0 + (r < nr ? r : 0)] : r0 + (r < nr ? r : 0)) * lda;
+    const half2 gm2 = __float2half2_rn(factors[e] * 16384.0f);
+    float c[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) c[i] = 0.0f;
+#pragma unroll 4
+    for (int g = g0; g < g0 + Gq; ++g) {
+        const uint2 q2 = __ldcs(cb + (size_t) g * 32);
+        const half2 sc2 = __hmul2(qpn_e4m3_half2(__ldg(sb + (size_t) g * 32)), gm2);
+        half2 b[8];
+        qpn_dequant8(q2.x, sc2, b + 0);
+        qpn_dequant8(q2.y, sc2, b + 4);
+        const unsigned* B = reinterpret_cast<const unsigned*>(b);
+        uint4 a01 = make_uint4(0, 0, 0, 0), a23 = make_uint4(0, 0, 0, 0);
+        if (r < nr) {
+            a01 = *reinterpret_cast<const uint4*>(xrow + g * 16);
+            a23 = *reinterpret_cast<const uint4*>(xrow + g * 16 + 8);
+        }
+        asm volatile("mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 {%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, {%0,%1,%2,%3,%4,%5,%6,%7};\n"
+                     : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]), "+f"(c[4]), "+f"(c[5]), "+f"(c[6]), "+f"(c[7]) : "r"(a01.x), "r"(a01.y), "r"(B[0]), "r"(B[1]));
+        asm volatile("mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 {%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, {%0,%1,%2,%3,%4,%5,%6,%7};\n"
+                     : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]), "+f"(c[4]), "+f"(c[5]), "+f"(c[6]), "+f"(c[7]) : "r"(a01.z), "r"(a01.w), "r"(B[2]), "r"(B[3]));
+        asm volatile("mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 {%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, {%0,%1,%2,%3,%4,%5,%6,%7};\n"
+                     : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]), "+f"(c[4]), "+f"(c[5]), "+f"(c[6]), "+f"(c[7]) : "r"(a23.x), "r"(a23.y), "r"(B[4]), "r"(B[5]));
+        asm volatile("mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 {%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, {%0,%1,%2,%3,%4,%5,%6,%7};\n"
+                     : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]), "+f"(c[4]), "+f"(c[5]), "+f"(c[6]), "+f"(c[7]) : "r"(a23.z), "r"(a23.w), "r"(B[6]), "r"(B[7]));
+    }
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int row = (i & 2) | ((lane & 16) ? 4 : 0) | (lane & 1);
+        cs[warp][row * 32 + qp * 8 + ((i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2))] = c[i];
+    }
+    __syncthreads();
+    for (int t = threadIdx.x; t < 256; t += blockDim.x) {
+        float v = 0.0f;
+#pragma unroll
+        for (int w = 0; w < SPLITK; ++w) v += cs[w][t];
+        const int row = t >> 5, col = t & 31;
+        if (row < nr) C[(size_t) (r0 + row) * N + (size_t) tile * 32 + col] = v;
+    }
+}
 // --- tensor-core variant (--tc 1): FP16 inputs, FP32 accumulation.  NVFP4 expert weights are exact in fp16
 // (e2m1 * e4m3 <= 2688, >= 2^-10, <= 6 significant bits; the per-expert factor stays an fp32 multiplier); the
 // activations are rounded to fp16 (2^-11 relative).  Residual stream, norms, router, gates, attention stay fp32.
@@ -3160,6 +3321,9 @@ static const bool g_fuse = std::getenv("INK2_FUSE") && std::atoi(std::getenv("IN
 static const bool g_mma = !(std::getenv("INK2_MMA") && std::atoi(std::getenv("INK2_MMA")) == 0);
 static bool g_mma_moe = !(std::getenv("INK2_MMA_MOE") && std::atoi(std::getenv("INK2_MMA_MOE")) == 0);
 static bool g_mma_plain = !(std::getenv("INK2_MMA_PLAIN") && std::atoi(std::getenv("INK2_MMA_PLAIN")) == 0);
+static bool g_qpn = false;
+static const int g_qpn_gu = std::getenv("INK2_QPN_GU") ? std::atoi(std::getenv("INK2_QPN_GU")) : 8;   // warps splitting K per tile: gate_up 4 / 8 / 9
+static const int g_qpn_dn = std::getenv("INK2_QPN_DN") ? std::atoi(std::getenv("INK2_QPN_DN")) : 4;   // down 4 / 8 / 9   // Volta QPN2 experts (a second, fragment-order copy of the NVFP4 layers): sm_70 and INK2_QPN=1
 
 // Experts live in fixed-size slots of a device pool (one pool per format), each slot one expert as
 // [w13 | w13 scales | w2 | w2 scales] (part A = w13 + scales, part B = w2 + scales).  The kernels address an expert
@@ -3168,6 +3332,8 @@ struct Experts {
     bool nvfp4 = true;
     const uint8_t* const* tA = nullptr;
     const uint8_t* const* tB = nullptr;
+    const uint8_t* const* qA = nullptr;   // Volta QPN2 copy of part A / B (E.qtabA / E.qtabB), null without INK2_QPN
+    const uint8_t* const* qB = nullptr;
     const float *f13 = nullptr, *f2 = nullptr;
     int gg13 = 0, gg2 = 0;       // GGUF: ggml types of gate_up (part A) and down (part B), 0 = the checkpoint formats
     size_t rb13 = 0, rb2 = 0;    //   bytes per row
@@ -3250,7 +3416,9 @@ struct Engine {
                           // layout) | i8r (3: i8 + Walsh-Hadamard rotation)
     // experts: every expert in layout order (NVFP4 layers 0-19 then MXFP8 layers 20-23, NE per layer, one slot
     // each); resident = the device pool holds them all, in that order
-    uint8_t *pool_nv = nullptr, *pool_mx = nullptr;
+    uint8_t *pool_nv = nullptr, *pool_mx = nullptr, *pool_q = nullptr;
+    __half *x16 = nullptr, *act16 = nullptr;   // QPN: the expert input as fp16 [H], the SwiGLU outputs as fp16 [TOPK * FF]
+    const uint8_t **qtabA = nullptr, **qtabB = nullptr;   // device [NL * NE]: QPN2 part A / B of expert (l, e) (layers < MXFP8_FIRST)
     const uint8_t **tabA = nullptr, **tabB = nullptr;   // device [NL * NE]: part A / part B of expert (l, e)
     std::vector<const uint8_t*> htabA, htabB;            // host mirrors
     // offload (--vram-reserve-mib N: leave N MiB of the card free, the expert pools take what remains): every expert
@@ -3398,6 +3566,13 @@ void expert_memory() {
         E.pool_nv = (uint8_t*) dalloc(ex_layer_off(NL));
     } else if (E.reserve_mib < 0) {
         E.pool_nv = (uint8_t*) dalloc((size_t) MXFP8_FIRST * NE * NV_BYTES);
+        if (g_qpn) {
+            E.pool_q = (uint8_t*) dalloc((size_t) MXFP8_FIRST * NE * NV_BYTES);
+            E.x16 = (__half*) dalloc((size_t) SMALL_T * H * sizeof(__half));
+            E.act16 = (__half*) dalloc((size_t) SMALL_T * TOPK * FF * sizeof(__half));
+            E.qtabA = (const uint8_t**) dalloc((size_t) NL * NE * sizeof(void*));
+            E.qtabB = (const uint8_t**) dalloc((size_t) NL * NE * sizeof(void*));
+        }
         E.pool_mx = (uint8_t*) dalloc((size_t) (NL - MXFP8_FIRST) * NE * MX_BYTES);
     } else {
         // every expert in host memory, registered (mapped) for the copies.  CPU experts on several nodes: each expert
@@ -3537,6 +3712,7 @@ void load() {
             }
             X.tA = E.tabA + (size_t) l * NE;
             X.tB = E.tabB + (size_t) l * NE;
+            if (E.pool_q && X.nvfp4) { X.qA = E.qtabA + (size_t) l * NE; X.qB = E.qtabB + (size_t) l * NE; }
         }
         if (X.nvfp4) {
             const vec a13 = ck.f32(q + "mlp.experts.w13_weight_amax"), d13 = ck.f32(q + "mlp.experts.w13_weight_outer_scale_denominator");
@@ -3557,6 +3733,27 @@ void load() {
     if (!E.offload) {
         CK(cudaMemcpy(E.tabA, E.htabA.data(), E.htabA.size() * sizeof(void*), cudaMemcpyHostToDevice));
         CK(cudaMemcpy(E.tabB, E.htabB.data(), E.htabB.size() * sizeof(void*), cudaMemcpyHostToDevice));
+    }
+    if (E.pool_q && !E.offload) {   // the QPN2 copy of the NVFP4 layers, built on the GPU from the resident pool
+        std::vector<const uint8_t*> qa((size_t) NL * NE, nullptr), qb((size_t) NL * NE, nullptr);
+        for (int l = 0; l < MXFP8_FIRST; ++l)
+            for (int e = 0; e < NE; ++e) {
+                uint8_t* d = E.pool_q + ex_layer_off(l) + (size_t) e * NV_BYTES;
+                const uint8_t* sa = E.htabA[l * NE + e];
+                const uint8_t* sb = E.htabB[l * NE + e];
+                k_qpn_repack<<<(unsigned) ((2 * FF / 32) * (H / 16) * 32 / 256), 256>>>(sa, d, 2 * FF, H);
+                k_qpn_repack<<<(unsigned) ((H / 32) * (FF / 16) * 32 / 256), 256>>>(sb, d + NV_A, H, FF);
+                qa[(size_t) l * NE + e] = d;
+                qb[(size_t) l * NE + e] = d + NV_A;
+            }
+        CK(cudaMemcpy(E.qtabA, qa.data(), qa.size() * sizeof(void*), cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(E.qtabB, qb.data(), qb.size() * sizeof(void*), cudaMemcpyHostToDevice));
+        CK(cudaDeviceSynchronize());
+        float fmax = 0.0f, fmin = 1e30f;
+        for (int l = 0; l < MXFP8_FIRST; ++l)
+            for (int e = 0; e < NE; ++e) for (float f : {E.hf13[(size_t) l * NE + e], E.hf2[(size_t) l * NE + e]}) { fmax = std::max(fmax, f); fmin = std::min(fmin, f); }
+        std::fprintf(stderr, "qpn: %d NVFP4 layers repacked into Volta fragment order (+%.1f GiB); expert factors %.3g .. %.3g (x 2^14 must stay under 65504)\n", MXFP8_FIRST,
+                     (double) MXFP8_FIRST * NE * NV_BYTES / 1073741824.0, fmin, fmax);
     }
 }
 
@@ -4830,6 +5027,18 @@ void moe(const Layer& Y, const float* x, const float* r, float* mhist, const flo
     if (X.gg13) {
         gg_sel<false, true>(X.gg13, X.tA, X.rb13, x, 0, E.gu, 2 * FF, H);
         gg_sel<true, false>(X.gg2, X.tB, X.rb2, E.gu, 2 * FF, E.ey, H, FF);
+    } else if (g_qpn && X.qA && !E.cpu && !E.offload) {   // Volta QPN2 experts: fragment-order copy, mma.m8n8k4 with the weights on the N side
+        k_f2h<<<(H + 255) / 256, 256>>>(x, E.x16, H);
+        switch (g_qpn_gu) {   // K split over this many warps per 32-column tile (K / 16 must divide evenly: 144 groups for gate_up, 72 for down)
+        case 4: k_qpn_sel<4, true><<<dim3(2 * FF / 32, TOPK), 128>>>(X.qA, X.f13, E.ids, E.x16, 0, E.gu, 2 * FF, H, E.act, E.act16); break;
+        case 9: k_qpn_sel<9, true><<<dim3(2 * FF / 32, TOPK), 288>>>(X.qA, X.f13, E.ids, E.x16, 0, E.gu, 2 * FF, H, E.act, E.act16); break;
+        default: k_qpn_sel<8, true><<<dim3(2 * FF / 32, TOPK), 256>>>(X.qA, X.f13, E.ids, E.x16, 0, E.gu, 2 * FF, H, E.act, E.act16);
+        }
+        switch (g_qpn_dn) {
+        case 8: k_qpn_sel<8, false><<<dim3(H / 32, TOPK), 256>>>(X.qB, X.f2, E.ids, E.act16, FF, E.ey, H, FF, nullptr, nullptr); break;
+        case 9: k_qpn_sel<9, false><<<dim3(H / 32, TOPK), 288>>>(X.qB, X.f2, E.ids, E.act16, FF, E.ey, H, FF, nullptr, nullptr); break;
+        default: k_qpn_sel<4, false><<<dim3(H / 32, TOPK), 128>>>(X.qB, X.f2, E.ids, E.act16, FF, E.ey, H, FF, nullptr, nullptr);
+        }
     } else if (g_mma_plain) {   // tensor-core experts for the single token (INK2_MMA_PLAIN=0: the CUDA-core kernels below)
         if (X.nvfp4) {
             k_moe_mma_grp<true><<<dim3((2 * FF + 31) / 32, TOPK), 256>>>(x, H, nullptr, X.tA, X.f13, nullptr, nullptr, nullptr, nullptr, nullptr,
@@ -5505,7 +5714,12 @@ void moe_b(const Layer& Y, const float* x, float* out, int T, int pos0) {
     // (g_pf_routed: set per chunk by forward_prefill; the small-T path below caches its own experts)
     if (g_pf_routed && !(T <= SMALL_T && !X.gg13))
         for (int t0 = 0; t0 < T; t0 += 8) expert_cache(l, PF.ids + (size_t) t0 * TOPK, std::min(8, T - t0) * TOPK);
-    if (T <= SMALL_T && !X.gg13) {   // offload: the verify's experts through the decode cache (T x TOPK ids), not the staging
+    if (T <= SMALL_T && !X.gg13 && g_qpn && X.qA && !E.offload && !E.cpu) {   // Volta QPN2: the fragment-order copy, mma.m8n8k4 with up to 8 rows per expert in one pass
+        k_f2h<<<(unsigned) (((size_t) T * H + 255) / 256), 256>>>(x, E.x16, T * H);
+        k_qpn_grp<8><<<dim3(2 * FF / 32, maxt), 256>>>(E.x16, H, PF.rows, X.qA, X.f13, PF.tile_e, PF.tile_r0, PF.ntiles, PF.eoff, PF.ecnt, PF.gu, 2 * FF, H);
+        kb_swiglu_h<<<(unsigned) (((size_t) nr * FF + 255) / 256), 256>>>(PF.gu, E.act16, nr);
+        k_qpn_grp<8><<<dim3(H / 32, maxt), 256>>>(E.act16, FF, nullptr, X.qB, X.f2, PF.tile_e, PF.tile_r0, PF.ntiles, PF.eoff, PF.ecnt, PF.ey, H, FF);
+    } else if (T <= SMALL_T && !X.gg13) {   // offload: the verify's experts through the decode cache (T x TOPK ids), not the staging
         // a verify block with the CPU experts: its misses on the CPU (other short chunks: fetched, as before)
         const bool vcpu = E.cpu && PF.rows_argmax && T <= ink2cpu::BELL_M;
         if (vcpu) {
@@ -6619,6 +6833,7 @@ int main(int argc, char** argv) {
             // INK2_MMA_MOE=1 / INK2_MMA_PLAIN=1 in the environment keep them on
             if (!std::getenv("INK2_MMA_MOE")) g_mma_moe = false;
             if (!std::getenv("INK2_MMA_PLAIN")) g_mma_plain = false;
+            g_qpn = std::getenv("INK2_QPN") && std::atoi(std::getenv("INK2_QPN")) == 1;
             std::fprintf(stderr, "sm_%d%d: mma.m16n8k8 runs as two mma.m8n8k4 (Volta); tensor-core MoE %s, plain-decode MoE %s\n", maj, mnr, g_mma_moe ? "on" : "off", g_mma_plain ? "on" : "off");
         }
     }
