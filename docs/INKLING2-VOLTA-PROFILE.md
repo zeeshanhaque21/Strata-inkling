@@ -22,10 +22,43 @@ so launch gaps are only about 9 %.
 - The dense GEMVs stage the activation vector in shared memory and synchronise before their first weight load, and the small ones (wo, qkv) launch only 270 to 290 blocks (3.6 per SM): latency, not bandwidth, sets their time.
 - The launch-shape knobs (`INK2_RPW`, `INK2_SEL_RPW`, `INK2_GEMV_MINB`) are flat within noise (79 to 82 tok/s) on the V100.
 
-## Done
-- Dense int8 GEMV issues each lane's first 16-byte weight load before staging x (`q8_prefetch`): bit-identical output, plain decode 79.4 to 81.2 tok/s (+2.2 %, three runs each).
+## What limits the expert GEMV (measured)
+Nsight Compute on `k_gemv_nvfp4_sel` (gate_up and down, 1,152 blocks of 256):
+- issue slots 54 % busy, IPC 2.2 of 4, DRAM 50 to 58 %: neither the ALUs nor the memory system are saturated;
+- warp stall reasons: **long_scoreboard 51 to 56 %** (waiting for loads), wait 12.7 %, not_selected 10 %, math_pipe_throttle 5.7 %.
+So the earlier guess (ALU-bound at about 6 operations per weight) was wrong; it is load latency that is not hidden well enough.
 
-## Next, by expected gain (estimates, not measurements)
-1. NVFP4 expert GEMV with cheaper decoding (pair nibbles n and n+4 across the two halves of a half2 word: about 25 % fewer ALU operations bit-exactly; or half2 math / tensor cores with a Volta-native fragment layout: the larger win but not bit-exact).  Up to about 12 % of the step.
-2. Fuse the small kernels (attention prep, partial, merge, router, gates): up to about 9 %.
-3. Split-K or more warps for the small dense GEMVs: about 4 %.
+`tools/volta_bw/` models the kernel one piece at a time (gate_up shape, 8 experts, 24 MB per launch, buffers larger than L2):
+
+| variant | time | GB/s |
+| --- | --- | --- |
+| weights only | 29.7 us | 805 |
+| + scale loads | 33.3 us | 717 |
+| + activation loads | 34.2 us | 698 |
+| + decode and FMA (the kernel) | 43.0 us | 555 |
+| same, unroll 3 | 40.2 us | 594 |
+| all loads hoisted into registers (9 trips) | 50.7 us | 471 |
+
+A bare streaming read of the same layout reaches about 720 GB/s whether each lane loads 4, 8 or 16 bytes, so the load width is not the problem.
+The decode and FMA work costs about 9 us although the ALUs are not full: loads and compute overlap only two iterations deep.
+
+## Done (all bit-identical to the previous build, same tokens)
+| change | plain decode, V100, 2.5K context |
+| --- | --- |
+| baseline (native sm_70 build) | 79.4 tok/s |
+| dense int8 GEMV: first weight load issued before x is staged | 81.2 (+2.2 %) |
+| NVFP4 expert GEMV: a word decoded as four half2 pairs {n_k, n_k+4} | 82.4 (+1.5 %) |
+| together | **+3.8 %** |
+
+## Tried, no gain (reverted)
+- launch-shape knobs `INK2_RPW`, `INK2_SEL_RPW`, `INK2_GEMV_MINB`: flat within noise (79 to 82);
+- unroll 3 of the expert GEMV loop: 80.2 (K = 1152 has 4.5 trips), unroll 3 for gate_up only: 82.0 against 82.5 although the microbenchmark gained 6.5 %;
+- expert GEMV prologue (expert pointer, first weight / scale / x loads before the scale table and barrier): 82.2 against 82.5;
+- all weight and scale loads of a lane hoisted into registers: slower (occupancy drops).
+
+## Where the rest is
+One decode step reads about 4.1 GB from DRAM (5,601 MB over 1.4 steps in the ncu window).  At the 720 to 800 GB/s that streaming reads reach on this card that is 5.1 to 5.7 ms, about 175 to 195 tok/s;
+the step takes 12.1 ms.  The gap is about 25 % tiny kernels (3 to 11 us each, latency-bound, about 1,050 launches per step) and GEMVs that stream at 50 to 60 % of that.
+- Fusing the small kernels (attn_partial + merge via a last-block-done counter, router into its neighbours, gate chains): about 1 to 2 % each, about 9 % in all.
+- The larger structural step is a persistent decode kernel that streams the next layer's weights while the current one computes; that is days of work, not a tuning pass.
+- A tensor-core NVFP4 / int8 expert path with weights loaded in Volta's own fragment layout (no lane shuffles) would remove the per-weight decode and FMAs from the CUDA cores; the shuffle-based emulation measured 27 % slower, the native layout is untested.
