@@ -3292,6 +3292,11 @@ struct DMat {
     int n = 0, k = 0;
     const int8_t* q = nullptr;     // or Q8_0 (GGUF): codes [n][k], fp16 scales [n][k / 32]
     const __half* qs = nullptr;
+    // Volta (INK2_DQ8): the same int8 codes in mma.m8n8k4 fragment order, for T <= 8 vectors (k_dq8): [tile of 32 rows][16-k group][lane] x 16 B, scales [tile][32-k group][lane] x 2 B.
+    // Row ranges start at segment boundaries (the stacked projection's q / k / v parts), each segment padded to whole tiles.
+    const uint8_t* dq = nullptr;
+    const __half* dqs = nullptr;
+    int nseg = 0, seg_row[4] = {0, 0, 0, 0}, seg_tile[4] = {0, 0, 0, 0};
 };
 // tensor-core / int8 switches (env: INK2_Q8 mask, INK2_MMA, INK2_MMA_MOE, INK2_MMA_PLAIN)
 static const int g_q8 = std::getenv("INK2_Q8") ? std::atoi(std::getenv("INK2_Q8")) : 1;   // int8 dense weights, bit mask (0 = all BF16): 1 unembed, 2 wo, 4 proj, 8 the drafter's dense weights
@@ -3303,6 +3308,7 @@ static const bool g_mma = !(std::getenv("INK2_MMA") && std::atoi(std::getenv("IN
 static bool g_mma_moe = !(std::getenv("INK2_MMA_MOE") && std::atoi(std::getenv("INK2_MMA_MOE")) == 0);
 static bool g_mma_plain = !(std::getenv("INK2_MMA_PLAIN") && std::atoi(std::getenv("INK2_MMA_PLAIN")) == 0);
 static bool g_qpn = false;
+static bool g_dq8 = false;   // Volta dense int8 GEMVs on the tensor cores (a fragment-order copy of the int8 weights): sm_70 and INK2_DQ8=1
 static const int g_qpn_gu = std::getenv("INK2_QPN_GU") ? std::atoi(std::getenv("INK2_QPN_GU")) : 8;   // warps splitting K per tile: gate_up 4 / 8 / 9
 static const int g_qpn_dn = std::getenv("INK2_QPN_DN") ? std::atoi(std::getenv("INK2_QPN_DN")) : 4;   // down 4 / 8 / 9   // Volta QPN2 experts (a second, fragment-order copy of the NVFP4 layers): sm_70 and INK2_QPN=1
 
@@ -3508,6 +3514,135 @@ DMat dmat_stack(const std::vector<std::string>& names) {   // BF16 matrices with
     return m;
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// Volta dense int8 GEMV on the tensor cores (INK2_DQ8=1; tools/volta_bw/gemv_dq8.cu has the microbenchmark and the numbers): the QPN2 mapping of the experts (v100-skinny, MIT, Dennis Vertzyas) for
+// int8 weights: y[t][row] = sum_k W[row][k] * s[row][k / 32] * x[t][k], t < 8.  A warp's quad-pair p owns 8 rows of a 32-row tile, the 8 activation rows are one shared fp16 fragment, the weights
+// come in fragment order (int8 -> fp16 exactly by 0x6400 | (q + 128) - 1152, the block scale folded in by one HMUL2: its rounding to fp16, 5e-4 relative per weight, is below the int8 quantization),
+// K is split over SPLITK warps.  600 to 720 GB/s on the large shapes (the emulated k_mma_q8_multi: about 210).
+__global__ void k_dq8_repack(const int8_t* __restrict__ q, const __half* __restrict__ qs, int nrows, int K, uint8_t* __restrict__ dq, __half* __restrict__ dqs) {
+    const int G = K >> 4;
+    const size_t idx = (size_t) blockIdx.x * blockDim.x + threadIdx.x;   // (tile, group, lane)
+    const int lane = (int) (idx & 31);
+    const size_t tg = idx >> 5;
+    const int g = (int) (tg % G), tile = (int) (tg / G);
+    const int row = tile * 32 + ((lane >> 2) & 3) * 8 + (lane & 3) + ((lane & 16) ? 4 : 0);
+    uint4 w = make_uint4(0, 0, 0, 0);
+    if (row < nrows) w = *reinterpret_cast<const uint4*>(q + (size_t) row * K + (size_t) g * 16);
+    *reinterpret_cast<uint4*>(dq + idx * 16) = w;
+    if ((g & 1) == 0) dqs[((size_t) tile * (G / 2) + (g >> 1)) * 32 + lane] = row < nrows ? qs[(size_t) row * (K / 32) + (g >> 1)] : __float2half(0.0f);
+}
+__device__ __forceinline__ void dq8_dec(unsigned w, half2 sc, unsigned& o0, unsigned& o1) {   // 4 int8 -> two half2 {q0, q1}, {q2, q3} times the scale
+    const unsigned x = w ^ 0x80808080u;
+    const unsigned h0 = __byte_perm(x, 0x64646464u, 0x4140), h1 = __byte_perm(x, 0x64646464u, 0x4342);
+    const half2 bias = __float2half2_rn(1152.0f);
+    const half2 a = __hmul2(__hsub2(*reinterpret_cast<const half2*>(&h0), bias), sc), b = __hmul2(__hsub2(*reinterpret_cast<const half2*>(&h1), bias), sc);
+    o0 = *reinterpret_cast<const unsigned*>(&a); o1 = *reinterpret_cast<const unsigned*>(&b);
+}
+__global__ void k_f2h_rows(const float* __restrict__ x, int ldx, __half* __restrict__ y, int K) {   // T rows of K floats (stride ldx) -> fp16 [T][K]
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < K) y[(size_t) blockIdx.y * K + i] = __float2half(x[(size_t) blockIdx.y * ldx + i]);
+}
+// x16 [M][K]; y [M][ldy] for the first n rows of this segment; grid ceil(n / 32), block 32 * SPLITK
+template <int SPLITK>
+__global__ void __launch_bounds__(32 * SPLITK) k_dq8(const uint8_t* __restrict__ codes, const __half* __restrict__ scales, const __half* __restrict__ x, float* __restrict__ y, int ldy, int n, int K, int M) {
+    __shared__ float cs[SPLITK][256];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, tile = blockIdx.x;
+    const int qp = (lane >> 2) & 3, r = (lane & 3) + ((lane & 16) ? 4 : 0), G = K >> 4, Gq = G / SPLITK, g0 = warp * Gq;
+    const uint4* cb = reinterpret_cast<const uint4*>(codes) + (size_t) tile * G * 32 + lane;
+    const __half* sb = scales + (size_t) tile * (G / 2) * 32 + lane;
+    const __half* xr = x + (size_t) (r < M ? r : 0) * K;
+    float c[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) c[i] = 0.0f;
+#pragma unroll 2
+    for (int g = g0; g < g0 + Gq; g += 2) {   // a pair of 16-k groups shares one scale
+        const half2 sc = __half2half2(__ldg(sb + (size_t) (g >> 1) * 32));
+        const uint4 w0 = __ldcs(cb + (size_t) g * 32), w1 = __ldcs(cb + (size_t) (g + 1) * 32);
+        uint4 a0 = make_uint4(0, 0, 0, 0), a1 = a0, a2 = a0, a3 = a0;
+        if (r < M) {
+            const uint4* xp = reinterpret_cast<const uint4*>(xr + g * 16);
+            a0 = xp[0]; a1 = xp[1]; a2 = xp[2]; a3 = xp[3];
+        }
+        unsigned b[8];
+        dq8_dec(w0.x, sc, b[0], b[1]); dq8_dec(w0.y, sc, b[2], b[3]); dq8_dec(w0.z, sc, b[4], b[5]); dq8_dec(w0.w, sc, b[6], b[7]);
+        asm volatile("mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 {%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, {%0,%1,%2,%3,%4,%5,%6,%7};\n" : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]), "+f"(c[4]), "+f"(c[5]), "+f"(c[6]), "+f"(c[7]) : "r"(a0.x), "r"(a0.y), "r"(b[0]), "r"(b[1]));
+        asm volatile("mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 {%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, {%0,%1,%2,%3,%4,%5,%6,%7};\n" : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]), "+f"(c[4]), "+f"(c[5]), "+f"(c[6]), "+f"(c[7]) : "r"(a0.z), "r"(a0.w), "r"(b[2]), "r"(b[3]));
+        asm volatile("mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 {%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, {%0,%1,%2,%3,%4,%5,%6,%7};\n" : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]), "+f"(c[4]), "+f"(c[5]), "+f"(c[6]), "+f"(c[7]) : "r"(a1.x), "r"(a1.y), "r"(b[4]), "r"(b[5]));
+        asm volatile("mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 {%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, {%0,%1,%2,%3,%4,%5,%6,%7};\n" : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]), "+f"(c[4]), "+f"(c[5]), "+f"(c[6]), "+f"(c[7]) : "r"(a1.z), "r"(a1.w), "r"(b[6]), "r"(b[7]));
+        dq8_dec(w1.x, sc, b[0], b[1]); dq8_dec(w1.y, sc, b[2], b[3]); dq8_dec(w1.z, sc, b[4], b[5]); dq8_dec(w1.w, sc, b[6], b[7]);
+        asm volatile("mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 {%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, {%0,%1,%2,%3,%4,%5,%6,%7};\n" : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]), "+f"(c[4]), "+f"(c[5]), "+f"(c[6]), "+f"(c[7]) : "r"(a2.x), "r"(a2.y), "r"(b[0]), "r"(b[1]));
+        asm volatile("mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 {%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, {%0,%1,%2,%3,%4,%5,%6,%7};\n" : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]), "+f"(c[4]), "+f"(c[5]), "+f"(c[6]), "+f"(c[7]) : "r"(a2.z), "r"(a2.w), "r"(b[2]), "r"(b[3]));
+        asm volatile("mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 {%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, {%0,%1,%2,%3,%4,%5,%6,%7};\n" : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]), "+f"(c[4]), "+f"(c[5]), "+f"(c[6]), "+f"(c[7]) : "r"(a3.x), "r"(a3.y), "r"(b[4]), "r"(b[5]));
+        asm volatile("mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 {%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, {%0,%1,%2,%3,%4,%5,%6,%7};\n" : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]), "+f"(c[4]), "+f"(c[5]), "+f"(c[6]), "+f"(c[7]) : "r"(a3.z), "r"(a3.w), "r"(b[6]), "r"(b[7]));
+    }
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int row = (i & 2) | ((lane & 16) ? 4 : 0) | (lane & 1), col = (i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2);
+        cs[warp][row * 32 + qp * 8 + col] = c[i];
+    }
+    __syncthreads();
+    for (int t = threadIdx.x; t < 256; t += blockDim.x) {
+        float v = 0.0f;
+#pragma unroll
+        for (int w = 0; w < SPLITK; ++w) v += cs[w][t];
+        const int row = t >> 5, col = tile * 32 + (t & 31);
+        if (row < M && col < n) y[(size_t) row * ldy + col] = v;
+    }
+}
+
+
+// the fragment-order copy of a quantized matrix (after quantize_q8); `starts`: row starts of the segments that are launched separately (each padded to whole 32-row tiles)
+static __half* g_dq_x16 = nullptr;   // fp16 copy of the activations [8][max K]
+void build_dq8(DMat& m, std::vector<int> starts) {
+    if (!g_dq8 || !m.q) return;
+    if (m.k % 256) return;   // the K split needs whole groups per warp
+    starts.push_back(m.n);
+    m.nseg = (int) starts.size() - 1;
+    if (m.nseg > 3) { std::fprintf(stderr, "build_dq8: %d segments\n", m.nseg); std::exit(1); }
+    int tiles = 0;
+    for (int sg = 0; sg < m.nseg; ++sg) { m.seg_row[sg] = starts[sg]; m.seg_tile[sg] = tiles; tiles += (starts[sg + 1] - starts[sg] + 31) / 32; }
+    m.seg_row[m.nseg] = m.n;
+    uint8_t* dq = (uint8_t*) dalloc((size_t) tiles * 32 * m.k);
+    __half* dqs = (__half*) dalloc((size_t) tiles * (m.k / 32) * 32 * 2);
+    for (int sg = 0; sg < m.nseg; ++sg) {
+        const int rows = starts[sg + 1] - starts[sg], t = (rows + 31) / 32;
+        k_dq8_repack<<<(unsigned) (((size_t) t * (m.k / 16) * 32 + 255) / 256), 256>>>(m.q + (size_t) starts[sg] * m.k, m.qs + (size_t) starts[sg] * (m.k / 32), rows, m.k,
+                                                                                   dq + (size_t) m.seg_tile[sg] * 32 * m.k, dqs + (size_t) m.seg_tile[sg] * (m.k / 32) * 32);
+    }
+    CK(cudaDeviceSynchronize());
+    m.dq = dq;
+    m.dqs = dqs;
+    if (!g_dq_x16) g_dq_x16 = (__half*) dalloc((size_t) 8 * 9216 * 2);
+}
+// rows [first, first + n) of a matrix with a fragment copy, T <= 8 vectors; false when the range does not start at a segment boundary.  A range may span several segments (each is launched
+// with its own output offset) and may end inside the last one.
+bool gemv_dq8(const DMat& W, int first, int n, const float* X, int ldx, float* Y, int ldy, int T) {
+    if (!W.dq || T > 8) return false;
+    int s0 = -1;
+    for (int sg = 0; sg < W.nseg; ++sg) if (first == W.seg_row[sg]) s0 = sg;
+    if (s0 < 0 || first + n > W.n) return false;
+    const int K = W.k, pairs = K / 32;
+    k_f2h_rows<<<dim3((K + 255) / 256, T), 256>>>(X, ldx, g_dq_x16, K);
+    for (int sg = s0; sg < W.nseg && W.seg_row[sg] < first + n; ++sg) {
+        const int rows = std::min(W.seg_row[sg + 1], first + n) - W.seg_row[sg], tiles = (rows + 31) / 32;
+        const uint8_t* dq = W.dq + (size_t) W.seg_tile[sg] * 32 * K;
+        const __half* dqs = W.dqs + (size_t) W.seg_tile[sg] * pairs * 32;
+        float* y = Y + (W.seg_row[sg] - first);
+        int sp = 8;
+        if (tiles < 160) for (int cand : {32, 24, 18, 16, 12, 9, 8}) if (pairs % cand == 0) { sp = cand; break; }
+        switch (sp) {
+        case 32: k_dq8<32><<<tiles, 32 * 32>>>(dq, dqs, g_dq_x16, y, ldy, rows, K, T); break;
+        case 24: k_dq8<24><<<tiles, 32 * 24>>>(dq, dqs, g_dq_x16, y, ldy, rows, K, T); break;
+        case 18: k_dq8<18><<<tiles, 32 * 18>>>(dq, dqs, g_dq_x16, y, ldy, rows, K, T); break;
+        case 16: k_dq8<16><<<tiles, 32 * 16>>>(dq, dqs, g_dq_x16, y, ldy, rows, K, T); break;
+        case 12: k_dq8<12><<<tiles, 32 * 12>>>(dq, dqs, g_dq_x16, y, ldy, rows, K, T); break;
+        case 9: k_dq8<9><<<tiles, 32 * 9>>>(dq, dqs, g_dq_x16, y, ldy, rows, K, T); break;
+        default: k_dq8<8><<<tiles, 32 * 8>>>(dq, dqs, g_dq_x16, y, ldy, rows, K, T);
+        }
+    }
+    return true;
+}
+
 // INK2_Q8: an int8 copy of a dense BF16 matrix (decode, verify, prefill and the fp32 path all have int8 branches); optionally frees the BF16 one
 void quantize_q8(DMat& m, int bit, bool drop_bf16 = false) {
     if (!(g_q8 & bit) || !m.d) return;
@@ -3610,6 +3745,7 @@ void load() {
     }
     E.unembed = dmat(p + "unembed.weight");
     quantize_q8(E.unembed, 1);
+    build_dq8(E.unembed, {0});
     {
         const vec q = ck.f32(p + "middle_cycle_cross_pass_queries"), kv = ck.f32(p + "middle_cycle_cross_pass_kv_queries");
         vec mq((size_t) NLOOP * 4 * H);
@@ -3642,6 +3778,8 @@ void load() {
         Y.wo = dmat(q + "attn.wo_ud.weight");
         quantize_q8(Y.wo, 2, true);
         quantize_q8(Y.proj, 4, true);
+        build_dq8(Y.wo, {0});
+        build_dq8(Y.proj, {0, Y.off_k, Y.off_v});
         Y.router = dmat(q + "mlp.gate.weight");
         Y.router_bias = fvec(q + "mlp.gate.bias");
         Y.q_scale = fvec(q + "attn.q_l2_clip.scale");
@@ -5466,6 +5604,7 @@ void sgemm(const float* Wf, int n, int K, const float* X, int ldx, float* Y, int
 }
 // rows [first, first + n) of W, T <= SMALL_T vectors
 void gemv_multi(const DMat& W, int first, int n, const float* X, int ldx, float* Y, int ldy, int T) {
+    if (W.dq && gemv_dq8(W, first, n, X, ldx, Y, ldy, T)) return;
     if (W.q && g_mma) {   // tensor-core int8 product (INK2_MMA=0: one decode GEMV per vector below)
         k_mma_q8_multi<<<(unsigned) ((n + 31) / 32), 256>>>(W.q + (size_t) first * W.k, W.qs + (size_t) first * (W.k / 32), X, ldx, Y, ldy, n, W.k, T);
         return;
@@ -6374,7 +6513,7 @@ void df2_load(const std::string& dir) {
     if (!e.empty()) { std::fprintf(stderr, "INK2_DRAFTER: %s\n", e.c_str()); std::exit(1); }
     const Ckpt* main_ck = E.ck;
     E.ck = &mk;
-    const bool q8 = std::getenv("INK2_DF2_Q8") && std::atoi(std::getenv("INK2_DF2_Q8")) == 1;
+    const bool q8 = std::getenv("INK2_DF2_Q8") ? std::atoi(std::getenv("INK2_DF2_Q8")) == 1 : g_dq8;   // int8 dense weights: default with the fragment kernel
     for (int i = 0; i < D2L; ++i) {
         D2Layer& Y = D2.L[i];
         const std::string q = "layers." + std::to_string(i) + ".";
@@ -6385,7 +6524,7 @@ void df2_load(const std::string& dir) {
         Y.down = dmat(q + "mlp.down_proj.weight");
         Y.ac_proj = dmat(q + "attention_conv.kernel_projection.weight");
         Y.mc_proj = dmat(q + "mlp_conv.kernel_projection.weight");
-        if (q8) for (DMat* m : {&Y.qkv, &Y.kvc, &Y.o, &Y.gu, &Y.down}) quantize_q8(*m, 8, true);
+        if (q8) for (DMat* m : {&Y.qkv, &Y.kvc, &Y.o, &Y.gu, &Y.down}) { quantize_q8(*m, 8, true); build_dq8(*m, {0}); }
         Y.in_ln = fvec(q + "input_layernorm.weight");
         Y.post_ln = fvec(q + "post_attention_layernorm.weight");
         Y.q_norm = fvec(q + "self_attn.q_norm.weight");
@@ -6546,7 +6685,7 @@ void draft_load(const std::string& dir) {
         Y.o = dmat(q + "self_attn.o_proj.weight");
         Y.gu = dmat_stack({q + "mlp.gate_proj.weight", q + "mlp.up_proj.weight"});
         Y.down = dmat(q + "mlp.down_proj.weight");
-        for (DMat* m : {&Y.qkv, &Y.kvc, &Y.o, &Y.gu, &Y.down}) quantize_q8(*m, 8, true);   // the drafter's dense weights (INK2_Q8 bit 8)
+        for (DMat* m : {&Y.qkv, &Y.kvc, &Y.o, &Y.gu, &Y.down}) { quantize_q8(*m, 8, true); build_dq8(*m, {0}); }   // the drafter's dense weights (INK2_Q8 bit 8)
         Y.in_ln = fvec(q + "input_layernorm.weight");
         Y.post_ln = fvec(q + "post_attention_layernorm.weight");
         Y.dflare = fvec(q + "dflare_norm.weight");
@@ -7143,6 +7282,7 @@ int main(int argc, char** argv) {
             if (!std::getenv("INK2_MMA_MOE")) g_mma_moe = false;
             if (!std::getenv("INK2_MMA_PLAIN")) g_mma_plain = false;
             g_qpn = std::getenv("INK2_QPN") && std::atoi(std::getenv("INK2_QPN")) == 1;
+            g_dq8 = std::getenv("INK2_DQ8") && std::atoi(std::getenv("INK2_DQ8")) == 1;
             std::fprintf(stderr, "sm_%d%d: mma.m16n8k8 runs as two mma.m8n8k4 (Volta); tensor-core MoE %s, plain-decode MoE %s\n", maj, mnr, g_mma_moe ? "on" : "off", g_mma_plain ? "on" : "off");
         }
     }
