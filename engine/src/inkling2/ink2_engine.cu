@@ -3154,8 +3154,9 @@ struct DMat {
 // tensor-core / int8 switches (env: INK2_Q8 mask, INK2_MMA, INK2_MMA_MOE, INK2_MMA_PLAIN)
 static const int g_q8 = std::getenv("INK2_Q8") ? std::atoi(std::getenv("INK2_Q8")) : 1;   // int8 dense weights, bit mask (0 = all BF16): 1 unembed, 2 wo, 4 proj, 8 the drafter's dense weights
 static const bool g_attn16 = !(std::getenv("INK2_ATTN16") && std::atoi(std::getenv("INK2_ATTN16")) == 0);
-// INK2_FUSE=0: the separate launches (attention partial / merge, router logits / top-k, attention tail / attnres) instead of the fused ones
-static const bool g_fuse = !(std::getenv("INK2_FUSE") && std::atoi(std::getenv("INK2_FUSE")) == 0);
+// INK2_FUSE=1: fused launches (attention partial + merge, router logits + top-k, attention tail + attnres).  Bit-identical, but 0.4 % slower on the V100
+// (nsys: only 6 % of a decode step is idle time between kernels), so off by default
+static const bool g_fuse = std::getenv("INK2_FUSE") && std::atoi(std::getenv("INK2_FUSE")) == 1;
 static const bool g_mma = !(std::getenv("INK2_MMA") && std::atoi(std::getenv("INK2_MMA")) == 0);
 static bool g_mma_moe = !(std::getenv("INK2_MMA_MOE") && std::atoi(std::getenv("INK2_MMA_MOE")) == 0);
 static bool g_mma_plain = !(std::getenv("INK2_MMA_PLAIN") && std::atoi(std::getenv("INK2_MMA_PLAIN")) == 0);
