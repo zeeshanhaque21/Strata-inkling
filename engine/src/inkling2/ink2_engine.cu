@@ -443,9 +443,16 @@ __global__ void k_gemv_gg_sel(const uint8_t* const* __restrict__ tab, size_t rb,
 __constant__ int c_q8w;   // INK2_Q8_WIDE (default: 1 before sm_80): 16-byte loads in the dense Q8 GEMV (0: 8-byte)
 #define g_q8_wide (c_q8w)
 // dense Q8_0 (repacked): y[row] = W[row] . x, as gemv_bf16_dot (one warp per R rows, x staged)
+// the first 16-byte word of each of the lane's rows, loaded before x is staged (the weight stream starts while x is copied): pre[r] = row r, word `lane`
+template <int R>
+__device__ __forceinline__ void q8_prefetch(const int8_t* __restrict__ Wq, int N, int K, int row0, uint4 (&pre)[R]) {
+    const int lane = threadIdx.x & 31;
+#pragma unroll
+    for (int r = 0; r < R; ++r) pre[r] = __ldg(reinterpret_cast<const uint4*>(Wq + (size_t) min(row0 + r, N - 1) * K) + lane);
+}
 template <int R>
 __device__ __forceinline__ void gemv_q8_dot(const int8_t* __restrict__ Wq, const __half* __restrict__ Ws, const float* xs,
-                                            float* __restrict__ y, int N, int K, int row0) {
+                                            float* __restrict__ y, int N, int K, int row0, const uint4 (&pre)[R]) {
     const int lane = threadIdx.x & 31;
     const uint2* w[R];
     const __half* sc[R];
@@ -468,7 +475,7 @@ __device__ __forceinline__ void gemv_q8_dot(const int8_t* __restrict__ Wq, const
             uint4 v[R];
             float f[R];
 #pragma unroll
-            for (int r = 0; r < R; ++r) { v[r] = __ldg(w16[r] + i); f[r] = __half2float(sc[r][i >> 1]); }
+            for (int r = 0; r < R; ++r) { v[r] = i == lane ? pre[r] : __ldg(w16[r] + i); f[r] = __half2float(sc[r][i >> 1]); }
             const float4 a = x4[4 * i], b = x4[4 * i + 1], c = x4[4 * i + 2], d = x4[4 * i + 3];
 #pragma unroll
             for (int r = 0; r < R; ++r) {
@@ -504,11 +511,13 @@ template <int R>
 __global__ void k_gemv_q8(const int8_t* __restrict__ Wq, const __half* __restrict__ Ws, const float* __restrict__ x,
                           float* __restrict__ y, int N, int K) {
     extern __shared__ float xs[];
+    const int row0 = (blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32) * R;
+    uint4 pre[R];
+    q8_prefetch<R>(Wq, N, K, row0, pre);
     for (int i = threadIdx.x; i < K; i += blockDim.x) xs[i] = x[i];
     __syncthreads();
-    const int row0 = (blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32) * R;
     if (row0 >= N) return;
-    gemv_q8_dot<R>(Wq, Ws, xs, y, N, K, row0);
+    gemv_q8_dot<R>(Wq, Ws, xs, y, N, K, row0, pre);
 }
 template <int R>
 __global__ void k_gemv_q8_qkv(const int8_t* __restrict__ Wq, const __half* __restrict__ Ws, const float* __restrict__ xq,
@@ -516,13 +525,15 @@ __global__ void k_gemv_q8_qkv(const int8_t* __restrict__ Wq, const __half* __res
                               float* __restrict__ y, int N, int K) {
     extern __shared__ float xs[];
     const int rb = blockIdx.x * (blockDim.x / 32) * R, re = min(rb + (int) (blockDim.x / 32) * R, N);
+    uint4 pre[R];
+    q8_prefetch<R>(Wq, N, K, (blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32) * R, pre);
     if (rb < b1) for (int i = threadIdx.x; i < K; i += blockDim.x) xs[i] = xq[i];
     if (rb < b2 && re > b1) for (int i = threadIdx.x; i < K; i += blockDim.x) xs[K + i] = xk[i];
     if (re > b2) for (int i = threadIdx.x; i < K; i += blockDim.x) xs[2 * K + i] = xv[i];
     __syncthreads();
     const int row0 = (blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32) * R;
     if (row0 >= N) return;
-    gemv_q8_dot<R>(Wq, Ws, xs + (row0 < b1 ? 0 : row0 < b2 ? K : 2 * K), y, N, K, row0);
+    gemv_q8_dot<R>(Wq, Ws, xs + (row0 < b1 ? 0 : row0 < b2 ? K : 2 * K), y, N, K, row0, pre);
 }
 // Q8 rows -> fp32 / fp16 (prompt products through cuBLAS); n8 = elements / 8
 __global__ void kb_q8_to_f32(const int8_t* __restrict__ q, const __half* __restrict__ sc, float* __restrict__ dst, size_t n8) {
