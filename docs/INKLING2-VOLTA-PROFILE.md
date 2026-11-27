@@ -131,6 +131,25 @@ That is 23 % faster at one token per expert, which is the decode regime, and fla
 Expected effect if the engine adopts it (expert kernels only, from the profiles above): plain decode 12.1 ms to about 11 ms (82 to about 90 tok/s), 4-sequence batched step 38 ms to about 34 ms (about 11 %).
 It uses fp16 activations (x rounded to fp16) with fp32 accumulation, like the Turing tensor-core path, so tokens will not be bit-identical to the CUDA-core path.
 
+## Sixth round: QPN2 experts in the engine (branch `volta-qpn`, `INK2_QPN=1`, sm_70 only)
+The NVFP4 expert layers (0 to 19) are repacked once at load, in place, into the fragment order of `mma.m8n8k4` (a layer is copied to a 0.53 GiB scratch and repacked back from it, so there is one copy: 17.21 GiB in VRAM against 16.67 GiB without).
+Kernels: `k_qpn_sel` (one token per expert, plain decode), `k_qpn_grp` (the plan tiles of `kb_moe_plan`, up to 8 rows per expert in one pass over the weights; batched decode and speculative verification), `k_qpn_repack` / `k_qpn_unpack`.
+Chunks larger than `SMALL_T` unpack the layer into the scratch (checkpoint order) and run the existing prefill GEMM on it, with the layer's tables swapped for the call.
+Design: v100-skinny (MIT, Dennis Vertzyas); see `rig-research/cachyos-t5810/v100-research/NOTES.md`.  The expert factor goes into the half2 scale (the e4m3 block scale alone times 2^14 overflows fp16 for scales above 4; the checkpoint's factors are 3.8e-5 to 3.2e-4).
+
+V100, 4096 context, k8v4, speculation off, every run started from a card at or below 55 C (an 8-sequence run that did not hit 83 C and throttled, which made an earlier comparison invalid):
+| | `INK2_QPN=0` | `INK2_QPN=1` |
+| --- | --- | --- |
+| plain decode, one stream | 82.5 tok/s | 86.4 (+4.8 %) |
+| 1 sequence, batched path | 46.4 | 52.1 (+12 %) |
+| 2 sequences | 75.3 | 91.6 (+22 %) |
+| 3 sequences | 97.4 | 124.3 (+28 %) |
+| 4 sequences | 115.1 | 151.6 to 152.1 (+32 %) |
+| 8 short sequences | 170.4 to 170.5 | 241.9 to 242.4 (+42 %) |
+Batched equals alone (`--ms-test`) for every sequence with QPN on, at 1, 2, 3, 4 and 8 sequences.
+Tokens differ from the CUDA-core path after about 30 tokens (fp16 activations, fp32 accumulation, like the Turing tensor-core path).
+Engine kernel against the microbenchmark: a code-generation cliff cost the engine kernel 5 us (41 against 36 us) until the activation load and the launch bounds were both changed; any single change recovered it.
+
 ## Tried, no gain (reverted)
 - launch-shape knobs `INK2_RPW`, `INK2_SEL_RPW`, `INK2_GEMV_MINB`: flat within noise (79 to 82);
 - unroll 3 of the expert GEMV loop: 80.2 (K = 1152 has 4.5 trips), unroll 3 for gate_up only: 82.0 against 82.5 although the microbenchmark gained 6.5 %;

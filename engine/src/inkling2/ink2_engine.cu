@@ -349,6 +349,30 @@ __global__ void k_qpn_repack(const uint8_t* __restrict__ src, uint8_t* __restric
     *reinterpret_cast<uint2*>(dst + idx * 8) = make_uint2(o[0], o[1]);
     dst[(size_t) N * (K / 2) + idx] = src[(size_t) N * (K / 2) + (size_t) col * G + g];
 }
+// the inverse, for the large prefill chunks: expert blockIdx.y of the table (QPN order) -> dst_base + blockIdx.y * dst_stride (checkpoint order)
+__global__ void k_qpn_unpack(const uint8_t* const* __restrict__ tab, uint8_t* __restrict__ dst_base, size_t dst_stride, int N, int K) {
+    const int G = K >> 4;
+    const size_t idx = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (size_t) (N / 32) * G * 32) return;
+    const uint8_t* src = tab[blockIdx.y];
+    uint8_t* dst = dst_base + (size_t) blockIdx.y * dst_stride;
+    const int lane = (int) (idx & 31);
+    const size_t tg = idx >> 5;
+    const int g = (int) (tg % G), tile = (int) (tg / G);
+    const int col = tile * 32 + ((lane >> 2) & 3) * 8 + (lane & 3) + ((lane & 16) ? 4 : 0);
+    const uint2 w = *reinterpret_cast<const uint2*>(src + idx * 8);
+    const uint8_t* bp = reinterpret_cast<const uint8_t*>(&w);
+    constexpr int ko[16] = {0, 2, 4, 6, 1, 3, 5, 7, 8, 10, 12, 14, 9, 11, 13, 15};
+    unsigned o[2] = {0u, 0u};
+#pragma unroll
+    for (int j = 0; j < 16; ++j) {   // QPN nibble j is the checkpoint's nibble ko[j] of the group
+        const unsigned n = (j & 1) ? bp[j >> 1] >> 4 : bp[j >> 1] & 15u;
+        const int k = ko[j];
+        o[k >> 3] |= n << (4 * (k & 7));
+    }
+    *reinterpret_cast<uint2*>(dst + (size_t) col * (K / 2) + (size_t) g * 8) = make_uint2(o[0], o[1]);
+    dst[(size_t) N * (K / 2) + (size_t) col * G + g] = src[(size_t) N * (K / 2) + idx];
+}
 // The TOPK selected experts, one token each (blockIdx.y = k): y[k][col] = factors[e] * W_e[col] . x_k, e = ids[k]; block = tile of 32 columns, SPLITK warps split K.
 // GU: columns 2j / 2j + 1 are gate j / up j: also act[k][j] = swiglu(gate, up) (the down GEMV's input), as k_gemv_nvfp4_sel does, and act16 as fp16 for it.
 // x is fp16 (x_stride in halves).  The expert's global factor goes into the half2 scale (factor * 2^14 * e4m3 stays in fp16 range for the checkpoint's factors; folding it after the
@@ -3416,9 +3440,10 @@ struct Engine {
                           // layout) | i8r (3: i8 + Walsh-Hadamard rotation)
     // experts: every expert in layout order (NVFP4 layers 0-19 then MXFP8 layers 20-23, NE per layer, one slot
     // each); resident = the device pool holds them all, in that order
-    uint8_t *pool_nv = nullptr, *pool_mx = nullptr, *pool_q = nullptr;
+    uint8_t *pool_nv = nullptr, *pool_mx = nullptr;
+    uint8_t* qscr = nullptr;                              // QPN: scratch of one layer's NVFP4 experts in checkpoint order (prefill unpacks into it)
+    const uint8_t **qscrA = nullptr, **qscrB = nullptr;   // device [NE] tables into qscr: part A / part B of expert e
     __half *x16 = nullptr, *act16 = nullptr;   // QPN: the expert input as fp16 [H], the SwiGLU outputs as fp16 [TOPK * FF]
-    const uint8_t **qtabA = nullptr, **qtabB = nullptr;   // device [NL * NE]: QPN2 part A / B of expert (l, e) (layers < MXFP8_FIRST)
     const uint8_t **tabA = nullptr, **tabB = nullptr;   // device [NL * NE]: part A / part B of expert (l, e)
     std::vector<const uint8_t*> htabA, htabB;            // host mirrors
     // offload (--vram-reserve-mib N: leave N MiB of the card free, the expert pools take what remains): every expert
@@ -3566,12 +3591,14 @@ void expert_memory() {
         E.pool_nv = (uint8_t*) dalloc(ex_layer_off(NL));
     } else if (E.reserve_mib < 0) {
         E.pool_nv = (uint8_t*) dalloc((size_t) MXFP8_FIRST * NE * NV_BYTES);
-        if (g_qpn) {
-            E.pool_q = (uint8_t*) dalloc((size_t) MXFP8_FIRST * NE * NV_BYTES);
+        if (g_qpn) {   // the NVFP4 layers are repacked in place (one copy); a layer's worth of scratch for the prefill unpack
+            E.qscr = (uint8_t*) dalloc((size_t) NE * NV_BYTES);
+            std::vector<const uint8_t*> a(NE), b(NE);
+            for (int e = 0; e < NE; ++e) { a[e] = E.qscr + (size_t) e * NV_BYTES; b[e] = a[e] + NV_A; }
+            E.qscrA = (const uint8_t**) upload(a.data(), NE * sizeof(void*));
+            E.qscrB = (const uint8_t**) upload(b.data(), NE * sizeof(void*));
             E.x16 = (__half*) dalloc((size_t) SMALL_T * H * sizeof(__half));
             E.act16 = (__half*) dalloc((size_t) SMALL_T * TOPK * FF * sizeof(__half));
-            E.qtabA = (const uint8_t**) dalloc((size_t) NL * NE * sizeof(void*));
-            E.qtabB = (const uint8_t**) dalloc((size_t) NL * NE * sizeof(void*));
         }
         E.pool_mx = (uint8_t*) dalloc((size_t) (NL - MXFP8_FIRST) * NE * MX_BYTES);
     } else {
@@ -3712,7 +3739,7 @@ void load() {
             }
             X.tA = E.tabA + (size_t) l * NE;
             X.tB = E.tabB + (size_t) l * NE;
-            if (E.pool_q && X.nvfp4) { X.qA = E.qtabA + (size_t) l * NE; X.qB = E.qtabB + (size_t) l * NE; }
+            if (E.qscr && X.nvfp4) { X.qA = X.tA; X.qB = X.tB; }   // the pool slots themselves hold the QPN layout (repacked at the end of load())
         }
         if (X.nvfp4) {
             const vec a13 = ck.f32(q + "mlp.experts.w13_weight_amax"), d13 = ck.f32(q + "mlp.experts.w13_weight_outer_scale_denominator");
@@ -3734,26 +3761,23 @@ void load() {
         CK(cudaMemcpy(E.tabA, E.htabA.data(), E.htabA.size() * sizeof(void*), cudaMemcpyHostToDevice));
         CK(cudaMemcpy(E.tabB, E.htabB.data(), E.htabB.size() * sizeof(void*), cudaMemcpyHostToDevice));
     }
-    if (E.pool_q && !E.offload) {   // the QPN2 copy of the NVFP4 layers, built on the GPU from the resident pool
-        std::vector<const uint8_t*> qa((size_t) NL * NE, nullptr), qb((size_t) NL * NE, nullptr);
-        for (int l = 0; l < MXFP8_FIRST; ++l)
+    if (E.qscr && !E.offload) {   // the NVFP4 layers into QPN order, in place: a layer copied to the scratch, repacked back from it
+        for (int l = 0; l < MXFP8_FIRST; ++l) {
+            uint8_t* lay = E.pool_nv + ex_layer_off(l);
+            CK(cudaMemcpy(E.qscr, lay, (size_t) NE * NV_BYTES, cudaMemcpyDeviceToDevice));
             for (int e = 0; e < NE; ++e) {
-                uint8_t* d = E.pool_q + ex_layer_off(l) + (size_t) e * NV_BYTES;
-                const uint8_t* sa = E.htabA[l * NE + e];
-                const uint8_t* sb = E.htabB[l * NE + e];
+                const uint8_t* sa = E.qscr + (size_t) e * NV_BYTES;
+                uint8_t* d = lay + (size_t) e * NV_BYTES;
                 k_qpn_repack<<<(unsigned) ((2 * FF / 32) * (H / 16) * 32 / 256), 256>>>(sa, d, 2 * FF, H);
-                k_qpn_repack<<<(unsigned) ((H / 32) * (FF / 16) * 32 / 256), 256>>>(sb, d + NV_A, H, FF);
-                qa[(size_t) l * NE + e] = d;
-                qb[(size_t) l * NE + e] = d + NV_A;
+                k_qpn_repack<<<(unsigned) ((H / 32) * (FF / 16) * 32 / 256), 256>>>(sa + NV_A, d + NV_A, H, FF);
             }
-        CK(cudaMemcpy(E.qtabA, qa.data(), qa.size() * sizeof(void*), cudaMemcpyHostToDevice));
-        CK(cudaMemcpy(E.qtabB, qb.data(), qb.size() * sizeof(void*), cudaMemcpyHostToDevice));
+        }
         CK(cudaDeviceSynchronize());
         float fmax = 0.0f, fmin = 1e30f;
         for (int l = 0; l < MXFP8_FIRST; ++l)
             for (int e = 0; e < NE; ++e) for (float f : {E.hf13[(size_t) l * NE + e], E.hf2[(size_t) l * NE + e]}) { fmax = std::max(fmax, f); fmin = std::min(fmin, f); }
-        std::fprintf(stderr, "qpn: %d NVFP4 layers repacked into Volta fragment order (+%.1f GiB); expert factors %.3g .. %.3g (x 2^14 must stay under 65504)\n", MXFP8_FIRST,
-                     (double) MXFP8_FIRST * NE * NV_BYTES / 1073741824.0, fmin, fmax);
+        std::fprintf(stderr, "qpn: %d NVFP4 layers repacked in place into Volta fragment order (+%.2f GiB scratch); expert factors %.3g .. %.3g (x 2^14 must stay under 65504)\n", MXFP8_FIRST,
+                     (double) NE * NV_BYTES / 1073741824.0, fmin, fmax);
     }
 }
 
@@ -5709,6 +5733,16 @@ void moe_b(const Layer& Y, const float* x, float* out, int T, int pos0) {
     kb_moe_plan<<<1, 1024>>>(PF.ids, T, PF.rows, PF.slot, PF.tile_e, PF.tile_r0, PF.ntiles, PF.eoff, PF.ecnt);
     const Experts& X = Y.ex;
     const int l = int(&Y - E.L), nr = T * TOPK, maxt = nr / FM + NE;
+    // Volta QPN2: the layer's experts are held in fragment order.  Up to SMALL_T rows use the QPN kernels directly; a larger chunk unpacks the layer into the scratch (checkpoint order) and
+    // runs the existing tensor-core GEMM on it, the tables swapped for the duration of this call.
+    struct QpnSwap { Experts* x = nullptr; const uint8_t* const *a = nullptr, *const *b = nullptr; ~QpnSwap() { if (x) { x->tA = a; x->tB = b; } } } qsw;
+    if (g_qpn && X.qA && !E.offload && !E.cpu && !(T <= SMALL_T && !X.gg13)) {
+        k_qpn_unpack<<<dim3((unsigned) ((2 * FF / 32) * (H / 16) * 32 / 256), NE), 256>>>(X.tA, E.qscr, NV_BYTES, 2 * FF, H);
+        k_qpn_unpack<<<dim3((unsigned) ((H / 32) * (FF / 16) * 32 / 256), NE), 256>>>(X.tB, E.qscr + NV_A, NV_BYTES, H, FF);
+        Experts& XM = const_cast<Experts&>(X);
+        qsw.x = &XM; qsw.a = XM.tA; qsw.b = XM.tB;
+        XM.tA = E.qscrA; XM.tB = E.qscrB;
+    }
     // A short chunk uses few experts: it makes the ones it routes to resident through the decode cache (groups of 8
     // tokens: at most 64 misses per plan) instead of streaming every expert the pools do not hold.
     // (g_pf_routed: set per chunk by forward_prefill; the small-T path below caches its own experts)
