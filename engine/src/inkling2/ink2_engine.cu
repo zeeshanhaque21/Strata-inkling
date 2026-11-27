@@ -7762,6 +7762,27 @@ int main(int argc, char** argv) {
         if (const char* t = std::getenv("INK2_TEMP")) smp.temp = std::strtof(t, nullptr);
         if (const char* t = std::getenv("INK2_SEED")) smp.rng.seed(std::strtoull(t, nullptr, 10));
         std::vector<int> out = {sample(logits, smp)};
+        if (const char* sb = std::getenv("INK2_SPEC_BENCH")) {   // the phases of one speculative cycle timed alone (nsys on this run attributes kernels cleanly)
+            const int N = std::max(1, std::atoi(sb)), pp = (int) ids.size(), anchor = out[0];
+            const char* only = std::getenv("INK2_SPEC_BENCH_ONLY");   // draft | verify | ctx | plain: just that phase (for nsys)
+            auto timed = [&](const char* what, auto&& fn) {
+                if (only && !std::strstr(what, only)) return;
+                for (int i = 0; i < 3; ++i) { fn(); CK(cudaDeviceSynchronize()); }
+                const double t0 = now_ms();
+                for (int i = 0; i < N; ++i) { fn(); CK(cudaDeviceSynchronize()); }
+                std::printf("spec-bench %-34s %7.3f ms\n", what, (now_ms() - t0) / N);
+            };
+            int d[DBLK], g[DBLK];
+            timed("draft (graph + copy of the drafts)", [&] { draft_run(anchor, pp); CK(cudaMemcpy(d, D.drafts, DBLK * 4, cudaMemcpyDeviceToHost)); });
+            draft_run(anchor, pp); CK(cudaMemcpy(d, D.drafts, DBLK * 4, cudaMemcpyDeviceToHost));
+            if (only && std::strcmp(only, "draft") == 0) CK(cudaDeviceSynchronize());
+            timed("verify 8 tokens (graph + argmax copy)", [&] { PF.rows_argmax = true; forward_prefill(d, DBLK, pp, nullptr); PF.rows_argmax = false; CK(cudaMemcpy(g, PF.am, DBLK * 4, cudaMemcpyDeviceToHost)); });
+            timed("drafter context, 8 rows", [&] { draft_context(PF.feat, pp, DBLK); draft_frnn(PF.feat + (size_t) (DBLK - 1) * 4 * H); });
+            timed("drafter context, 1 row", [&] { draft_context(PF.feat, pp, 1); draft_frnn(PF.feat); });
+            timed("plain decode step (graph)", [&] { step(anchor, pp, true); });
+            std::fflush(stdout);
+            return 0;
+        }
         spec_continue(out[0], (int) ids.size(), n_gen, smp, [&](int t) { out.push_back(t); return true; }, nullptr);
         CK(cudaDeviceSynchronize());
         const double s2 = now_ms();
