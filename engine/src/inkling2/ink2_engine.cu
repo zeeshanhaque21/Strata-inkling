@@ -1594,11 +1594,39 @@ __device__ __forceinline__ uint32_t q8_pair_h2(uint32_t w_xor, uint32_t sel) {  
 }
 __device__ __forceinline__ void mma_m16n8k8(float& d0, float& d1, float& d2, float& d3, uint32_t a0, uint32_t a1, uint32_t b0) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
-    __trap();   // Volta has no m16n8k8: the host never launches k_mma_q8_multi there (g_mma is off below sm_75), this only lets sm_70 compile
+    __trap();   // Volta has no m16n8k8: its kernels go through macc_mma / ink2_volta_mma.cuh, this only lets sm_70 compile
 #else
     asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
                  : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3) : "r"(a0), "r"(a1), "r"(b0));
 #endif
+}
+// an accumulator of a chain of mma.m16n8k8 into c0..c3: on Turing the instruction itself; on Volta the chain stays in Volta's layout (ink2_volta_mma.cuh)
+#include "ink2_volta_mma.cuh"
+struct MAcc {
+    float c0, c1, c2, c3;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
+    float v[8];
+#endif
+};
+__device__ __forceinline__ void macc_init(MAcc& m, float c0, float c1, float c2, float c3) {
+    m.c0 = c0; m.c1 = c1; m.c2 = c2; m.c3 = c3;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
+#pragma unroll
+    for (int i = 0; i < 8; ++i) m.v[i] = 0.0f;
+#endif
+}
+__device__ __forceinline__ void macc_mma(MAcc& m, uint32_t a0, uint32_t a1, uint32_t b0) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
+    volta_step(m.v, a0, a1, b0);
+#else
+    mma_m16n8k8(m.c0, m.c1, m.c2, m.c3, a0, a1, b0);
+#endif
+}
+__device__ __forceinline__ void macc_done(MAcc& m, float& c0, float& c1, float& c2, float& c3) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
+    volta_finish(m.v, m.c0, m.c1, m.c2, m.c3);
+#endif
+    c0 = m.c0; c1 = m.c1; c2 = m.c2; c3 = m.c3;
 }
 __global__ void __launch_bounds__(256) k_mma_q8_multi(const int8_t* __restrict__ W, const __half* __restrict__ S,
                                                       const float* __restrict__ X, int ldx, float* __restrict__ Y, int ldy,
@@ -1640,10 +1668,13 @@ __global__ void __launch_bounds__(256) k_mma_q8_multi(const int8_t* __restrict__
             float c0 = 0, c1 = 0, c2 = 0, c3 = 0;
             const uint2 u0 = make_uint2(wv[2 * i].x ^ 0x80808080u, wv[2 * i].y ^ 0x80808080u);          // row g
             const uint2 u1 = make_uint2(wv[2 * i + 1].x ^ 0x80808080u, wv[2 * i + 1].y ^ 0x80808080u);  // row g + 8
-            mma_m16n8k8(c0, c1, c2, c3, q8_pair_h2(u0.x, 0x4140), q8_pair_h2(u1.x, 0x4140), b[0]);
-            mma_m16n8k8(c0, c1, c2, c3, q8_pair_h2(u0.x, 0x4342), q8_pair_h2(u1.x, 0x4342), b[1]);
-            mma_m16n8k8(c0, c1, c2, c3, q8_pair_h2(u0.y, 0x4140), q8_pair_h2(u1.y, 0x4140), b[2]);
-            mma_m16n8k8(c0, c1, c2, c3, q8_pair_h2(u0.y, 0x4342), q8_pair_h2(u1.y, 0x4342), b[3]);
+            MAcc m;
+            macc_init(m, c0, c1, c2, c3);
+            macc_mma(m, q8_pair_h2(u0.x, 0x4140), q8_pair_h2(u1.x, 0x4140), b[0]);
+            macc_mma(m, q8_pair_h2(u0.x, 0x4342), q8_pair_h2(u1.x, 0x4342), b[1]);
+            macc_mma(m, q8_pair_h2(u0.y, 0x4140), q8_pair_h2(u1.y, 0x4140), b[2]);
+            macc_mma(m, q8_pair_h2(u0.y, 0x4342), q8_pair_h2(u1.y, 0x4342), b[3]);
+            macc_done(m, c0, c1, c2, c3);
             const float s0 = __half2float(sv[2 * i]), s1 = __half2float(sv[2 * i + 1]);
             acc[4 * i + 0] += s0 * c0; acc[4 * i + 1] += s0 * c1; acc[4 * i + 2] += s1 * c2; acc[4 * i + 3] += s1 * c3;
         }
@@ -1743,6 +1774,8 @@ __global__ void __launch_bounds__(256) k_moe_mma_grp(const float* __restrict__ A
 #pragma unroll
         for (int i = 0; i < 2; ++i) {   // m-tile: rows g (r = 2i) and g + 8 (r = 2i + 1)
             float c0 = acc[4 * i], c1 = acc[4 * i + 1], c2 = acc[4 * i + 2], c3 = acc[4 * i + 3];
+            MAcc m;
+            macc_init(m, c0, c1, c2, c3);
             if (NV) {
                 const uint32_t s0 = e4h[sc[2 * i]], s1 = e4h[sc[2 * i + 1]];
                 const uint32_t u0[2] = {wv[2 * i].x, wv[2 * i].y}, u1[2] = {wv[2 * i + 1].x, wv[2 * i + 1].y};
@@ -1753,7 +1786,7 @@ __global__ void __launch_bounds__(256) k_moe_mma_grp(const float* __restrict__ A
                     const uint32_t p0 = e2m1x2_h(by0), p1 = e2m1x2_h(by1);
                     const __half2 h0 = __hmul2(*reinterpret_cast<const __half2*>(&p0), *reinterpret_cast<const __half2*>(&s0));
                     const __half2 h1 = __hmul2(*reinterpret_cast<const __half2*>(&p1), *reinterpret_cast<const __half2*>(&s1));
-                    mma_m16n8k8(c0, c1, c2, c3, *reinterpret_cast<const uint32_t*>(&h0), *reinterpret_cast<const uint32_t*>(&h1), b[j]);
+                    macc_mma(m, *reinterpret_cast<const uint32_t*>(&h0), *reinterpret_cast<const uint32_t*>(&h1), b[j]);
                 }
             } else {
                 const float s0 = exp2f((float) sc[2 * i] - 109.0f), s1 = exp2f((float) sc[2 * i + 1] - 109.0f);   // 2^(s-127) 2^8 2^10
@@ -1766,9 +1799,10 @@ __global__ void __launch_bounds__(256) k_moe_mma_grp(const float* __restrict__ A
                     const uint32_t pb = (j & 1) ? (((wb >> 16) & 0xffu) | ((wb & 0xff000000u) >> 8)) : ((wb & 0xffu) | ((wb & 0xff00u) << 8));
                     const float2 fa = e4m3x2(pa), fb = e4m3x2(pb);
                     const __half2 h0 = __floats2half2_rn(fa.x * s0, fa.y * s0), h1 = __floats2half2_rn(fb.x * s1, fb.y * s1);
-                    mma_m16n8k8(c0, c1, c2, c3, *reinterpret_cast<const uint32_t*>(&h0), *reinterpret_cast<const uint32_t*>(&h1), b[j]);
+                    macc_mma(m, *reinterpret_cast<const uint32_t*>(&h0), *reinterpret_cast<const uint32_t*>(&h1), b[j]);
                 }
             }
+            macc_done(m, c0, c1, c2, c3);
             acc[4 * i] = c0; acc[4 * i + 1] = c1; acc[4 * i + 2] = c2; acc[4 * i + 3] = c3;
         }
     }
@@ -3009,7 +3043,7 @@ struct DMat {
 // tensor-core / int8 switches (env: INK2_Q8 mask, INK2_MMA, INK2_MMA_MOE, INK2_MMA_PLAIN)
 static const int g_q8 = std::getenv("INK2_Q8") ? std::atoi(std::getenv("INK2_Q8")) : 1;   // int8 dense weights, bit mask (0 = all BF16): 1 unembed, 2 wo, 4 proj, 8 the drafter's dense weights
 static const bool g_attn16 = !(std::getenv("INK2_ATTN16") && std::atoi(std::getenv("INK2_ATTN16")) == 0);
-static bool g_mma = !(std::getenv("INK2_MMA") && std::atoi(std::getenv("INK2_MMA")) == 0);   // (off at start on a card without mma.m16n8k8: sm_70)
+static const bool g_mma = !(std::getenv("INK2_MMA") && std::atoi(std::getenv("INK2_MMA")) == 0);
 static bool g_mma_moe = !(std::getenv("INK2_MMA_MOE") && std::atoi(std::getenv("INK2_MMA_MOE")) == 0);
 static bool g_mma_plain = !(std::getenv("INK2_MMA_PLAIN") && std::atoi(std::getenv("INK2_MMA_PLAIN")) == 0);
 
@@ -6441,14 +6475,17 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "kv-pool: %ld tokens is less than the context %d: raised to the context (one sequence must be able to reach it)\n", E.kvpool, E.ctx);
         E.kvpool = E.ctx;
     }
-    {   // a card below sm_75 (Volta) has no mma.m16n8k8: the int8 GEMV for T <= 8 uses its CUDA-core version
+    {   // a card below sm_75 (Volta) has no mma.m16n8k8: its kernels run it as two mma.m8n8k4 (ink2_volta_mma.cuh)
         int dev = 0, maj = 0, mnr = 0;
         CK(cudaGetDevice(&dev));
         CK(cudaDeviceGetAttribute(&maj, cudaDevAttrComputeCapabilityMajor, dev));
         CK(cudaDeviceGetAttribute(&mnr, cudaDevAttrComputeCapabilityMinor, dev));
-        if (maj * 10 + mnr < 75) {   // k_mma_q8_multi and k_moe_mma_grp are the two users of mma.m16n8k8
-            g_mma = g_mma_moe = g_mma_plain = false;
-            std::fprintf(stderr, "sm_%d%d: no mma.m16n8k8: the tensor-core int8 GEMV and MoE kernels are off (INK2_MMA=0, INK2_MMA_MOE=0, INK2_MMA_PLAIN=0)\n", maj, mnr);
+        if (maj * 10 + mnr < 75) {
+            // measured on a V100: the dense int8 tensor-core GEMV gains (+22 % batched), the MoE ones lose (-27 %: a chain of 8 products pays six shuffles each);
+            // INK2_MMA_MOE=1 / INK2_MMA_PLAIN=1 in the environment keep them on
+            if (!std::getenv("INK2_MMA_MOE")) g_mma_moe = false;
+            if (!std::getenv("INK2_MMA_PLAIN")) g_mma_plain = false;
+            std::fprintf(stderr, "sm_%d%d: mma.m16n8k8 runs as two mma.m8n8k4 (Volta); tensor-core MoE %s, plain-decode MoE %s\n", maj, mnr, g_mma_moe ? "on" : "off", g_mma_plain ? "on" : "off");
         }
     }
     if (E.grow || E.kvpool > 0) vmm_init();
