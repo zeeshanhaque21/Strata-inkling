@@ -150,6 +150,9 @@ Batched equals alone (`--ms-test`) for every sequence with QPN on, at 1, 2, 3, 4
 Tokens differ from the CUDA-core path after about 30 tokens (fp16 activations, fp32 accumulation, like the Turing tensor-core path).
 Engine kernel against the microbenchmark: a code-generation cliff cost the engine kernel 5 us (41 against 36 us) until the activation load and the launch bounds were both changed; any single change recovered it.
 
+**Prefill cost of the single copy.**  Chunks above 8 rows unpack the layer into the scratch before the existing GEMM.  20,000-token prefill, 1024-token chunks: without QPN 1,759 tok/s; with QPN and the first unpack kernel (8-byte strided writes) 1,253 (-29 %); with the shared-memory-staged unpack (coalesced both ways) 1,573 (-10.6 %), tokens identical (hash `ac582fefb5`).
+The remaining 1.3 s is 800 layer unpacks of 573 MB read and written at about 700 GB/s: it can only shrink with larger chunks or a prefill GEMM that reads the QPN layout directly.
+
 ### Speculative decoding with QPN (`--spec 1`, the model's own DSpark drafter, 300 tokens, greedy, 8192 context, V100 from a cool start)
 | prompt (tokens) | QPN, spec off | QPN, spec on | drafts accepted per verify | no QPN, spec on | no QPN, spec off |
 | --- | --- | --- | --- | --- | --- |

@@ -349,29 +349,40 @@ __global__ void k_qpn_repack(const uint8_t* __restrict__ src, uint8_t* __restric
     *reinterpret_cast<uint2*>(dst + idx * 8) = make_uint2(o[0], o[1]);
     dst[(size_t) N * (K / 2) + idx] = src[(size_t) N * (K / 2) + (size_t) col * G + g];
 }
-// the inverse, for the large prefill chunks: expert blockIdx.y of the table (QPN order) -> dst_base + blockIdx.y * dst_stride (checkpoint order)
+// the inverse, for the large prefill chunks: expert blockIdx.y of the table (QPN order) -> dst_base + blockIdx.y * dst_stride (checkpoint order).
+// Block (tile of 32 columns x 8 groups): the QPN side is contiguous in (group, lane), the checkpoint side in (column, group): staged through shared memory so both are coalesced
+// (the first version wrote 8 bytes per thread at a row stride: the unpack cost 29 % of a 20k-token prefill).
+constexpr int QU_G = 8;
 __global__ void k_qpn_unpack(const uint8_t* const* __restrict__ tab, uint8_t* __restrict__ dst_base, size_t dst_stride, int N, int K) {
-    const int G = K >> 4;
-    const size_t idx = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= (size_t) (N / 32) * G * 32) return;
+    __shared__ uint2 sw[32][QU_G];
+    __shared__ uint8_t ss[QU_G][33];
+    const int G = K >> 4, gchunks = G / QU_G;
     const uint8_t* src = tab[blockIdx.y];
     uint8_t* dst = dst_base + (size_t) blockIdx.y * dst_stride;
-    const int lane = (int) (idx & 31);
-    const size_t tg = idx >> 5;
-    const int g = (int) (tg % G), tile = (int) (tg / G);
-    const int col = tile * 32 + ((lane >> 2) & 3) * 8 + (lane & 3) + ((lane & 16) ? 4 : 0);
-    const uint2 w = *reinterpret_cast<const uint2*>(src + idx * 8);
-    const uint8_t* bp = reinterpret_cast<const uint8_t*>(&w);
-    constexpr int ko[16] = {0, 2, 4, 6, 1, 3, 5, 7, 8, 10, 12, 14, 9, 11, 13, 15};
-    unsigned o[2] = {0u, 0u};
+    const int tile = (int) blockIdx.x / gchunks, g0 = ((int) blockIdx.x % gchunks) * QU_G;
+    {
+        const int lane = threadIdx.x & 31, gi = threadIdx.x >> 5;   // 256 threads: gi 0..7
+        const size_t idx = ((size_t) tile * G + g0 + gi) * 32 + lane;
+        const int cl = ((lane >> 2) & 3) * 8 + (lane & 3) + ((lane & 16) ? 4 : 0);
+        const uint2 w = *reinterpret_cast<const uint2*>(src + idx * 8);
+        const uint8_t* bp = reinterpret_cast<const uint8_t*>(&w);
+        constexpr int ko[16] = {0, 2, 4, 6, 1, 3, 5, 7, 8, 10, 12, 14, 9, 11, 13, 15};
+        unsigned o[2] = {0u, 0u};
 #pragma unroll
-    for (int j = 0; j < 16; ++j) {   // QPN nibble j is the checkpoint's nibble ko[j] of the group
-        const unsigned n = (j & 1) ? bp[j >> 1] >> 4 : bp[j >> 1] & 15u;
-        const int k = ko[j];
-        o[k >> 3] |= n << (4 * (k & 7));
+        for (int j = 0; j < 16; ++j) {   // QPN nibble j is the checkpoint's nibble ko[j] of the group
+            const unsigned n = (j & 1) ? bp[j >> 1] >> 4 : bp[j >> 1] & 15u;
+            o[ko[j] >> 3] |= n << (4 * (ko[j] & 7));
+        }
+        sw[cl][gi] = make_uint2(o[0], o[1]);
+        ss[gi][cl] = src[(size_t) N * (K / 2) + idx];
     }
-    *reinterpret_cast<uint2*>(dst + (size_t) col * (K / 2) + (size_t) g * 8) = make_uint2(o[0], o[1]);
-    dst[(size_t) N * (K / 2) + (size_t) col * G + g] = src[(size_t) N * (K / 2) + idx];
+    __syncthreads();
+    {
+        const int cl = threadIdx.x >> 3, gi = threadIdx.x & 7;   // 32 columns x 8 groups
+        const int col = tile * 32 + cl;
+        *reinterpret_cast<uint2*>(dst + (size_t) col * (K / 2) + (size_t) (g0 + gi) * 8) = sw[cl][gi];
+        dst[(size_t) N * (K / 2) + (size_t) col * G + g0 + gi] = ss[gi][cl];
+    }
 }
 // The TOPK selected experts, one token each (blockIdx.y = k): y[k][col] = factors[e] * W_e[col] . x_k, e = ids[k]; block = tile of 32 columns, SPLITK warps split K.
 // GU: columns 2j / 2j + 1 are gate j / up j: also act[k][j] = swiglu(gate, up) (the down GEMV's input), as k_gemv_nvfp4_sel does, and act16 as fp16 for it.
@@ -5678,8 +5689,8 @@ void moe_b(const Layer& Y, const float* x, float* out, int T, int pos0) {
     // runs the existing tensor-core GEMM on it, the tables swapped for the duration of this call.
     struct QpnSwap { Experts* x = nullptr; const uint8_t* const *a = nullptr, *const *b = nullptr; ~QpnSwap() { if (x) { x->tA = a; x->tB = b; } } } qsw;
     if (g_qpn && X.qA && !E.offload && !E.cpu && !(T <= SMALL_T && !X.gg13)) {
-        k_qpn_unpack<<<dim3((unsigned) ((2 * FF / 32) * (H / 16) * 32 / 256), NE), 256>>>(X.tA, E.qscr, NV_BYTES, 2 * FF, H);
-        k_qpn_unpack<<<dim3((unsigned) ((H / 32) * (FF / 16) * 32 / 256), NE), 256>>>(X.tB, E.qscr + NV_A, NV_BYTES, H, FF);
+        k_qpn_unpack<<<dim3((unsigned) ((2 * FF / 32) * (H / 16 / QU_G)), NE), 256>>>(X.tA, E.qscr, NV_BYTES, 2 * FF, H);
+        k_qpn_unpack<<<dim3((unsigned) ((H / 32) * (FF / 16 / QU_G)), NE), 256>>>(X.tB, E.qscr + NV_A, NV_BYTES, H, FF);
         Experts& XM = const_cast<Experts&>(X);
         qsw.x = &XM; qsw.a = XM.tA; qsw.b = XM.tB;
         XM.tA = E.qscrA; XM.tB = E.qscrB;
