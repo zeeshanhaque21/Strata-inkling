@@ -5957,6 +5957,9 @@ void layer_forward_b(int l, Slot& S, int nB, const float* msgs, int T, int pos0)
 constexpr int DL = 3, DFF = 9216, DBLK = 8, MR = 256, DQKV = QD + 2 * KVD, DSPLIT_KEYS = 256, DSPLIT_MAX = 256;
 constexpr int DLOCAL_CAP = WINDOW + 64;   // local layers keep [p - 1024, p + 8)
 constexpr float DTHETA = 1e6f, MCAP = 30.0f;
+__device__ float d_theta = DTHETA;   // the drafter's RoPE base and local-attention window (DFlash 2 sets 1e4 / 2048 at load)
+__device__ int d_win = WINDOW;
+static int g_dwin = WINDOW;
 
 // out[r] = rms(sum_t alpha[t] f[r][t]) * w; f rows [4][H] (stride 4H)
 __global__ void kd_mix_rms(const float* __restrict__ f, const float* __restrict__ alpha, const float* __restrict__ w,
@@ -6003,7 +6006,7 @@ __device__ __forceinline__ float head_norm_rope(float v, const float* __restrict
     sm[d] = v * rsqrtf(ss / HD + EPS) * w[d];
     __syncthreads();
     const int i = d & 63;
-    const float inv = 1.0f / powf(DTHETA, (float) (2 * i) / HD), ang = (float) pos * inv;
+    const float inv = 1.0f / powf(d_theta, (float) (2 * i) / HD), ang = (float) pos * inv;
     float s, c;
     sincosf(ang, &s, &c);
     const float x1 = sm[i], x2 = sm[i + 64];
@@ -6011,16 +6014,17 @@ __device__ __forceinline__ float head_norm_rope(float v, const float* __restrict
 }
 // block rows: q heads (q_norm) and k heads (k_norm) normed + roped in place at pos0 + row; k / v into the cache
 __global__ void kd_qk_rope_store(float* qkv, const float* __restrict__ qn, const float* __restrict__ kn, int pos0,
-                                 __half* K, __half* V, int cap) {
+                                 __half* K, __half* V, int cap, int nq) {   // nq query heads (DSpark 24, DFlash 2 32): rows [q (nq HD) | k (KVD) | v (KVD)]
     pos0 = VPOS(pos0);
+    const int qd = nq * HD, dqkv = qd + 2 * KVD;
     const int h = blockIdx.x, r = blockIdx.y, d = threadIdx.x;
-    float* x = qkv + (size_t) r * DQKV + (h < NQ ? h * HD : QD + (h - NQ) * HD);
-    const float o = head_norm_rope(x[d], h < NQ ? qn : kn, pos0 + r);
+    float* x = qkv + (size_t) r * dqkv + (h < nq ? h * HD : qd + (h - nq) * HD);
+    const float o = head_norm_rope(x[d], h < nq ? qn : kn, pos0 + r);
     x[d] = o;
-    if (h >= NQ) {
-        const size_t c = (size_t) ((pos0 + r) % cap) * KVD + (h - NQ) * HD + d;
+    if (h >= nq) {
+        const size_t c = (size_t) ((pos0 + r) % cap) * KVD + (h - nq) * HD + d;
         K[c] = __float2half(o);
-        V[c] = __float2half(qkv[(size_t) r * DQKV + QD + KVD + (h - NQ) * HD + d]);
+        V[c] = __float2half(qkv[(size_t) r * dqkv + qd + KVD + (h - nq) * HD + d]);
     }
 }
 // context K / V of committed positions pos0 + r: kv rows [k (KVD) | v (KVD)]; k normed (k_norm_ctx) + roped
@@ -6042,18 +6046,19 @@ __device__ __forceinline__ float4 ld4h(const __half* p) {
 }
 // keys [lo, p + DBLK), lo = 0 or (local) p + DBLK - (WINDOW + DBLK), spread over gridDim.y splits
 __global__ void kd_attn_partial(const float* __restrict__ qkv, const __half* __restrict__ K, const __half* __restrict__ V,
-                                int cap, int p, int local, float* pm, float* pl, float* po) {
+                                int cap, int p, int local, float* pm, float* pl, float* po, int nq) {
+    const int dqkv = nq * HD + 2 * KVD, nrep = nq / NKV;
     p = VPOS(p);
     // (local == 2: ablation, the block only, no context)
-    const int hi = p + DBLK, lo = local == 2 ? p : local ? max(0, hi - (WINDOW + DBLK)) : 0, per = (hi - lo + gridDim.y - 1) / gridDim.y;
-    const int h = blockIdx.x, s = blockIdx.y, g = h / NREP, w = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int hi = p + DBLK, lo = local == 2 ? p : local ? max(0, hi - (d_win + DBLK)) : 0, per = (hi - lo + gridDim.y - 1) / gridDim.y;
+    const int h = blockIdx.x, s = blockIdx.y, g = h / nrep, w = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int k0 = lo + s * per, k1 = min(hi, k0 + per);
     const float scale = rsqrtf((float) HD);
     float4 q[DBLK], acc[DBLK];
     float m[DBLK], l[DBLK];
 #pragma unroll
     for (int r = 0; r < DBLK; ++r) {
-        const float4 t = *reinterpret_cast<const float4*>(qkv + (size_t) r * DQKV + h * HD + 4 * lane);
+        const float4 t = *reinterpret_cast<const float4*>(qkv + (size_t) r * dqkv + h * HD + 4 * lane);
         q[r] = make_float4(t.x * scale, t.y * scale, t.z * scale, t.w * scale);
         acc[r] = make_float4(0, 0, 0, 0);
         m[r] = -INFINITY;
@@ -6097,7 +6102,7 @@ __global__ void kd_attn_partial(const float* __restrict__ qkv, const __half* __r
     }
 }
 __global__ void kd_attn_merge(const float* __restrict__ pm, const float* __restrict__ pl, const float* __restrict__ po,
-                              int ns, float* __restrict__ att) {
+                              int ns, float* __restrict__ att, int nq) {
     const int h = blockIdx.x, r = blockIdx.y, d = threadIdx.x;
     float M = -INFINITY;
     for (int s = 0; s < ns; ++s) M = fmaxf(M, pm[((size_t) h * DSPLIT_MAX + s) * DBLK + r]);
@@ -6109,7 +6114,7 @@ __global__ void kd_attn_merge(const float* __restrict__ pm, const float* __restr
         L += pl[idx] * cf;
         O += po[idx * HD + d] * cf;
     }
-    att[(size_t) r * QD + h * HD + d] = O / L;
+    att[(size_t) r * (nq * HD) + h * HD + d] = O / L;
 }
 __global__ void kd_silu_mul(const float* __restrict__ gu, float* __restrict__ act) {
     const int r = blockIdx.y, j = blockIdx.x * blockDim.x + threadIdx.x;
@@ -6200,6 +6205,114 @@ __global__ void kd_fold(const uint16_t* __restrict__ U, const float* __restrict_
     if (threadIdx.x == 0) fold_b[v] = ab;
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// DFlash 2 drafter (incoai/Inkling-2-Mini-DFlash2, INK2_DRAFTER=<dir>; reference: sglang srt/models/dflash.py DFlash2DraftModel).  5 Qwen3-style layers (hidden 2304, 32 / 8 heads of 128, FF 6912,
+// q / k RMSNorm, NeoX RoPE theta 1e4, sliding window 2048, bidirectional over the block) with a grouped dynamic depthwise 2-tap convolution around the attention and the MLP of every layer;
+// no embeddings or LM head of its own (the target's).  Input rows: the anchor and 7 mask tokens' target embeddings.  Context K / V of a committed position: hidden_norm(fc(its 4 target
+// features)) through the layer's k_proj (+ k_norm, RoPE) and v_proj.  The 7 final rows go through the target's LM head; the top 16 candidates per row, corrected by a rank-256 bilinear score
+// of (previous slot's candidate, this slot's candidate) given the row's hidden state; the greedy walk takes the best candidate of slot 0, then for each next slot the best given the
+// previous pick (softcap after the correction is monotonic: not needed for the argmax).  The drafter only proposes: nothing here can change the output, only the acceptance.
+constexpr int D2NQ = 32, D2QD = D2NQ * HD, D2QKV = D2QD + 2 * KVD;   // 32 query heads (the main model has NQ = 24)
+constexpr int D2L = 5, D2FF = 6912, D2G = H / 16, D2COEF = 4 * D2G, D2TOPK = 16, D2NB = 64, D2RANK = 256, D2SLOTS = DBLK - 1, D2MASK = 200056;
+constexpr int D2WIN = 2048, D2CAP = D2WIN + DBLK + 64;
+// out[r] = (base[side][0] + delta0[r]) * x[r] + (base[side][1] + delta1[r]) * x[r - 1] (r > 0), per channel i with group i / 16; coef [r][side][tap][group], base_kernel [side][tap][H]
+__global__ void kd2_conv(const float* __restrict__ x, const float* __restrict__ coef, const float* __restrict__ base_kernel, int side, float* __restrict__ y) {
+    const int r = blockIdx.x;
+    const float* base = base_kernel + (size_t) side * 2 * H;
+    const float* cr = coef + (size_t) r * D2COEF + side * 2 * D2G;
+    for (int i = threadIdx.x; i < H; i += blockDim.x) {
+        const int g = i >> 4;
+        float v = (base[i] + cr[g]) * x[(size_t) r * H + i];
+        if (r > 0) v += (base[H + i] + cr[D2G + g]) * x[(size_t) (r - 1) * H + i];
+        y[(size_t) r * H + i] = v;
+    }
+}
+__global__ void kd2_silu_mul(const float* __restrict__ gu, float* __restrict__ act) {
+    const int r = blockIdx.y, j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= D2FF) return;
+    const float g = gu[(size_t) r * 2 * D2FF + j], u = gu[(size_t) r * 2 * D2FF + D2FF + j];
+    act[(size_t) r * D2FF + j] = g / (1.0f + expf(-g)) * u;
+}
+// top 16 of each of the 7 rows of logits [7][VOCAB]: stage 1 (D2NB blocks per row, a slice each: 16 rounds of block argmax), stage 2 (merge D2NB * 16)
+constexpr int D2PER = (VOCAB + D2NB - 1) / D2NB, D2NPT = (D2PER + 255) / 256;
+__global__ void kd2_topk1(const float* __restrict__ lg, float* __restrict__ pv, int* __restrict__ pi) {
+    const int row = blockIdx.y, b = blockIdx.x, lo = b * D2PER, hi = min(VOCAB, lo + D2PER);
+    const float* x = lg + (size_t) row * VOCAB;
+    float v[D2NPT];
+#pragma unroll
+    for (int j = 0; j < D2NPT; ++j) {
+        const int idx = lo + threadIdx.x + j * 256;
+        const float t = idx < hi ? x[idx] : -INFINITY;
+        v[j] = t != t ? -INFINITY : t;
+    }
+    __shared__ float wv;
+    __shared__ int wi;
+    for (int round = 0; round < D2TOPK; ++round) {
+        float bv = -INFINITY;
+        int bj = -1;
+#pragma unroll
+        for (int j = 0; j < D2NPT; ++j)
+            if (v[j] > bv) { bv = v[j]; bj = j; }
+        const int myidx = bj >= 0 ? lo + threadIdx.x + bj * 256 : 0x7fffffff;
+        float rv = bv;
+        int ri = myidx;
+        am_block(rv, ri);
+        if (threadIdx.x == 0) { wv = rv; wi = ri; pv[((size_t) row * D2NB + b) * D2TOPK + round] = rv; pi[((size_t) row * D2NB + b) * D2TOPK + round] = ri; }
+        __syncthreads();
+        if (bj >= 0 && myidx == wi) v[bj] = -INFINITY;
+        __syncthreads();
+    }
+}
+__global__ void kd2_topk2(const float* __restrict__ pv, const int* __restrict__ pi, int* __restrict__ cand, float* __restrict__ cval) {
+    const int row = blockIdx.x;
+    constexpr int N = D2NB * D2TOPK, NPT = N / 256;
+    float v[NPT];
+    int id[NPT];
+#pragma unroll
+    for (int j = 0; j < NPT; ++j) { v[j] = pv[(size_t) row * N + threadIdx.x + j * 256]; id[j] = pi[(size_t) row * N + threadIdx.x + j * 256]; }
+    __shared__ int wi;
+    for (int round = 0; round < D2TOPK; ++round) {
+        float bv = -INFINITY;
+        int bi = 0x7fffffff, bj = -1;
+#pragma unroll
+        for (int j = 0; j < NPT; ++j)
+            if (v[j] > bv || (v[j] == bv && v[j] > -INFINITY && id[j] < bi)) { bv = v[j]; bi = id[j]; bj = j; }
+        float rv = bv;
+        int ri = bi;
+        am_block(rv, ri);
+        if (threadIdx.x == 0) { wi = ri; cand[row * D2TOPK + round] = ri; cval[row * D2TOPK + round] = rv; }
+        __syncthreads();
+        if (bj >= 0 && bi == wi) v[bj] = -INFINITY;
+        __syncthreads();
+    }
+}
+__device__ __forceinline__ float bf16f(uint16_t u) { return __uint_as_float((uint32_t) u << 16); }
+// greedy walk over the candidate lattice, one block of 16 warps (one candidate each): drafts[1 + l] for slot l = 0..6; drafts[0] is the anchor
+__global__ void kd2_walk(const int* __restrict__ cand, const float* __restrict__ cval, const float* __restrict__ hp, const uint16_t* __restrict__ A,
+                         const uint16_t* __restrict__ Bm, int* __restrict__ drafts) {
+    __shared__ float sc[D2TOPK];
+    __shared__ int pred_s;
+    const int w = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    if (threadIdx.x == 0) pred_s = drafts[0];
+    __syncthreads();
+    for (int l = 0; l < D2SLOTS; ++l) {
+        const int pred = pred_s, id = cand[l * D2TOPK + w];
+        float s = 0.0f;
+        for (int r = lane; r < D2RANK; r += 32) s += bf16f(A[(size_t) pred * D2RANK + r]) * hp[l * D2RANK + r] * bf16f(Bm[(size_t) id * D2RANK + r]);
+        s = warp_sum(s);
+        if (lane == 0) sc[w] = cval[l * D2TOPK + w] + s;
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            int best = 0;
+            for (int c = 1; c < D2TOPK; ++c) if (sc[c] > sc[best]) best = c;
+            const int tok = cand[l * D2TOPK + best];
+            drafts[l + 1] = tok;
+            pred_s = tok;
+        }
+        __syncthreads();
+    }
+}
+
 struct DLayer {
     DMat qkv, kvc, o, gu, down;
     const float *in_ln, *post_ln, *dflare, *q_norm, *k_norm, *k_norm_ctx;
@@ -6221,7 +6334,193 @@ struct Drafter {
 Drafter D;
 int g_draft_abl = 0;   // INK2_DRAFT_ABL (tests): 1 = no Markov bias, 2 = no context K/V
 
+// ---- DFlash 2 host side
+struct D2Layer {
+    DMat qkv, kvc, o, gu, down, ac_proj, mc_proj;
+    const float *in_ln, *post_ln, *q_norm, *k_norm, *ac_base, *mc_base;
+    __half *K = nullptr, *V = nullptr;
+    int cap = D2CAP;
+};
+struct DFlash2 {
+    bool on = false;
+    D2Layer L[D2L];
+    DMat fc, hproj, pred, succ;
+    const float *hidden_norm, *norm, *mask_row;
+    float *ctxh, *coef, *xc, *hp, *cval, *tv;
+    int *cand, *ti;
+    bool embnorm = false;
+} D2;
+bool g_df2 = false;
+// INK2_DF2_DUMP=<dir>: the first DFlash 2 context and block (eager, outside the graph) written to <dir> for the numpy reference (tools/dflash2/ref_check.py)
+static const char* g_df2_dump = std::getenv("INK2_DF2_DUMP");
+static bool g_df2_dump_ctx = true, g_df2_dump_blk = false;
+void df2_dump(const char* name, const void* dev, size_t bytes) {
+    CK(cudaDeviceSynchronize());
+    std::vector<uint8_t> h(bytes);
+    CK(cudaMemcpy(h.data(), dev, bytes, cudaMemcpyDeviceToHost));
+    const std::string path = std::string(g_df2_dump) + "/" + name;
+    FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) { std::fprintf(stderr, "df2 dump: cannot write %s\n", path.c_str()); return; }
+    std::fwrite(h.data(), 1, bytes, f);
+    std::fclose(f);
+}
+
+void df2_load(const std::string& dir) {
+    Ckpt mk;
+    mk.path = dir + "/model.safetensors";
+    const std::string e = strata::image::st_read_header(mk.path, mk.st);
+    if (!e.empty()) { std::fprintf(stderr, "INK2_DRAFTER: %s\n", e.c_str()); std::exit(1); }
+    const Ckpt* main_ck = E.ck;
+    E.ck = &mk;
+    const bool q8 = std::getenv("INK2_DF2_Q8") && std::atoi(std::getenv("INK2_DF2_Q8")) == 1;
+    for (int i = 0; i < D2L; ++i) {
+        D2Layer& Y = D2.L[i];
+        const std::string q = "layers." + std::to_string(i) + ".";
+        Y.qkv = dmat_stack({q + "self_attn.q_proj.weight", q + "self_attn.k_proj.weight", q + "self_attn.v_proj.weight"});
+        Y.kvc = dmat_stack({q + "self_attn.k_proj.weight", q + "self_attn.v_proj.weight"});
+        Y.o = dmat(q + "self_attn.o_proj.weight");
+        Y.gu = dmat_stack({q + "mlp.gate_proj.weight", q + "mlp.up_proj.weight"});
+        Y.down = dmat(q + "mlp.down_proj.weight");
+        Y.ac_proj = dmat(q + "attention_conv.kernel_projection.weight");
+        Y.mc_proj = dmat(q + "mlp_conv.kernel_projection.weight");
+        if (q8) for (DMat* m : {&Y.qkv, &Y.kvc, &Y.o, &Y.gu, &Y.down}) quantize_q8(*m, 8, true);
+        Y.in_ln = fvec(q + "input_layernorm.weight");
+        Y.post_ln = fvec(q + "post_attention_layernorm.weight");
+        Y.q_norm = fvec(q + "self_attn.q_norm.weight");
+        Y.k_norm = fvec(q + "self_attn.k_norm.weight");
+        Y.ac_base = fvec(q + "attention_conv.base_kernel");
+        Y.mc_base = fvec(q + "mlp_conv.base_kernel");
+        Y.cap = D2CAP;
+        Y.K = (__half*) dalloc((size_t) Y.cap * KVD * 2);
+        Y.V = (__half*) dalloc((size_t) Y.cap * KVD * 2);
+    }
+    D2.fc = dmat("fc.weight");
+    D2.hidden_norm = fvec("hidden_norm.weight");
+    D2.norm = fvec("norm.weight");
+    D2.hproj = dmat("candidate_selector.hidden_projection.weight");
+    D2.pred = dmat("candidate_selector.predecessor_codebook");
+    D2.succ = dmat("candidate_selector.successor_codebook");
+    E.ck = main_ck;
+    if (D2.fc.n != H || D2.fc.k != 4 * H || D2.hproj.n != D2RANK || D2.pred.k != D2RANK) { std::fprintf(stderr, "INK2_DRAFTER: unexpected tensor shapes\n"); std::exit(1); }
+    D2.embnorm = !(std::getenv("INK2_DF2_EMBNORM") && std::atoi(std::getenv("INK2_DF2_EMBNORM")) == 0);   // the drafter was trained on the target's normed embeddings: 0 accepted drafts without the norm, 6.2 of 7 with it
+    {   // the mask token's target embedding (raw, or through the target's embed norm)
+        const int mid = std::getenv("INK2_DF2_MASK") ? std::atoi(std::getenv("INK2_DF2_MASK")) : D2MASK;
+        vec row(H);
+        embed_row(mid, row.data());
+        if (D2.embnorm) {
+            float ss = 0.0f;
+            for (float v : row) ss += v * v;
+            const float r = 1.0f / std::sqrt(ss / H + EPS);
+            const vec w = E.ck->f32("model.llm.embed_norm.weight");
+            for (int i = 0; i < H; ++i) row[i] = row[i] * r * w[i];
+        }
+        D2.mask_row = dvec(row);
+    }
+    const float theta = 1e4f;
+    int win = D2WIN;
+    CK(cudaMemcpyToSymbol(d_theta, &theta, 4));
+    CK(cudaMemcpyToSymbol(d_win, &win, 4));
+    g_dwin = D2WIN;
+    D.x = dfloats(DBLK * H); D.res = dfloats(DBLK * H); D.xn = dfloats(DBLK * H); D.qkv = dfloats(DBLK * D2QKV);
+    D.att = dfloats(DBLK * D2QD); D.gu = dfloats((size_t) DBLK * 2 * D2FF); D.act = dfloats((size_t) DBLK * D2FF);
+    D.out = dfloats(DBLK * H); D.base = dfloats((size_t) D2SLOTS * VOCAB);
+    D.ctxc = dfloats((size_t) DBLK * H); D.ctxkv = dfloats((size_t) DBLK * 2 * KVD);
+    D.pm = dfloats((size_t) D2NQ * DSPLIT_MAX * DBLK); D.pl = dfloats((size_t) D2NQ * DSPLIT_MAX * DBLK);
+    D.po = dfloats((size_t) D2NQ * DSPLIT_MAX * DBLK * HD);
+    D.drafts = (int*) dalloc(DBLK * 4);
+    D2.ctxh = dfloats((size_t) DBLK * H); D2.coef = dfloats((size_t) DBLK * D2COEF); D2.xc = dfloats((size_t) DBLK * H);
+    D2.hp = dfloats((size_t) D2SLOTS * D2RANK); D2.cval = dfloats((size_t) D2SLOTS * D2TOPK); D2.cand = (int*) dalloc((size_t) D2SLOTS * D2TOPK * 4);
+    D2.tv = dfloats((size_t) D2SLOTS * D2NB * D2TOPK); D2.ti = (int*) dalloc((size_t) D2SLOTS * D2NB * D2TOPK * 4);
+    D2.on = true;
+    g_df2 = true;
+    D.on = true;
+    std::fprintf(stderr, "drafter: DFlash 2 from %s (%d layers, FF %d, window %d%s%s)\n", dir.c_str(), D2L, D2FF, D2WIN, q8 ? ", int8 dense" : "", D2.embnorm ? ", embed norm" : "");
+}
+void df2_context(const float* feat, int pos0, int n) {
+    if (g_df2_dump && g_df2_dump_ctx) {
+        g_df2_dump_ctx = false;
+        df2_dump("feat.bin", feat, (size_t) n * 4 * H * 4);
+        FILE* f = std::fopen((std::string(g_df2_dump) + "/meta.txt").c_str(), "w");
+        if (f) { std::fprintf(f, "pos0 %d n %d\n", pos0, n); std::fclose(f); }
+    }
+    for (int r0 = 0; r0 < n; r0 += DBLK) {
+        const int m = std::min(DBLK, n - r0);
+        gemv_multi(D2.fc, 0, H, feat + (size_t) r0 * 4 * H, 4 * H, D2.ctxh, H, m);
+        k_rms<<<m, 512>>>(D2.ctxh, D2.hidden_norm, D.ctxc, H);
+        for (int i = 0; i < D2L; ++i) {
+            D2Layer& Y = D2.L[i];
+            gemv_multi(Y.kvc, 0, 2 * KVD, D.ctxc, H, D.ctxkv, 2 * KVD, m);
+            kd_ctx_store<<<dim3(NKV, m), HD>>>(D.ctxkv, Y.k_norm, pos0 + r0, Y.K, Y.V, Y.cap);
+        }
+    }
+}
+// the block (p < 0: from d_vpos); D.drafts[0] holds the anchor token on entry
+void df2_device(int p) {
+    // block rows: the anchor's embedding, then 7 mask embeddings
+    if (D2.embnorm) rms(E.emb_in, E.embed_norm, D.x); else copy(D.x, E.emb_in, H);
+    for (int r = 1; r < DBLK; ++r) copy(D.x + (size_t) r * H, D2.mask_row, H);
+    const bool dump = g_df2_dump && g_df2_dump_blk;
+    if (dump) df2_dump("emb.bin", D.x, (size_t) DBLK * H * 4);
+    const float* prev = D.x;
+    for (int i = 0; i < D2L; ++i) {
+        D2Layer& Y = D2.L[i];
+        kd_add_rms<<<DBLK, 512>>>(prev, D.res, Y.in_ln, D.xn, i == 0);
+        const bool d0 = dump && i == 0;   // layer 0's sub-steps, for tools/dflash2/ref_check.py
+        if (d0) df2_dump("s0_xn.bin", D.xn, (size_t) DBLK * H * 4);
+        gemv_multi(Y.ac_proj, 0, D2COEF, D.xn, H, D2.coef, D2COEF, DBLK);
+        if (d0) df2_dump("s0_coefA.bin", D2.coef, (size_t) DBLK * D2COEF * 4);
+        kd2_conv<<<DBLK, 256>>>(D.xn, D2.coef, Y.ac_base, 0, D2.xc);
+        if (d0) df2_dump("s0_xcA.bin", D2.xc, (size_t) DBLK * H * 4);
+        gemv_multi(Y.qkv, 0, D2QKV, D2.xc, H, D.qkv, D2QKV, DBLK);
+        kd_qk_rope_store<<<dim3(D2NQ + NKV, DBLK), HD>>>(D.qkv, Y.q_norm, Y.k_norm, p, Y.K, Y.V, Y.cap, D2NQ);
+        if (d0) df2_dump("s0_qkv.bin", D.qkv, (size_t) DBLK * D2QKV * 4);
+        const int ns = std::min(DSPLIT_MAX, std::max(1, (D2WIN + DBLK + DSPLIT_KEYS - 1) / DSPLIT_KEYS));
+        kd_attn_partial<<<dim3(D2NQ, ns), 128>>>(D.qkv, Y.K, Y.V, Y.cap, p, 1, D.pm, D.pl, D.po, D2NQ);
+        kd_attn_merge<<<dim3(D2NQ, DBLK), HD>>>(D.pm, D.pl, D.po, ns, D.att, D2NQ);
+        if (d0) df2_dump("s0_att.bin", D.att, (size_t) DBLK * D2QD * 4);
+        gemv_multi(Y.o, 0, H, D.att, D2QD, D.out, H, DBLK);
+        if (d0) df2_dump("s0_o.bin", D.out, (size_t) DBLK * H * 4);
+        kd2_conv<<<DBLK, 256>>>(D.out, D2.coef, Y.ac_base, 1, D2.xc);
+        kd_add_rms<<<DBLK, 512>>>(D2.xc, D.res, Y.post_ln, D.xn, 0);
+        if (d0) df2_dump("s0_xn2.bin", D.xn, (size_t) DBLK * H * 4);
+        gemv_multi(Y.mc_proj, 0, D2COEF, D.xn, H, D2.coef, D2COEF, DBLK);
+        kd2_conv<<<DBLK, 256>>>(D.xn, D2.coef, Y.mc_base, 0, D2.xc);
+        gemv_multi(Y.gu, 0, 2 * D2FF, D2.xc, H, D.gu, 2 * D2FF, DBLK);
+        kd2_silu_mul<<<dim3(D2FF / 256, DBLK), 256>>>(D.gu, D.act);
+        if (d0) df2_dump("s0_act.bin", D.act, (size_t) DBLK * D2FF * 4);
+        gemv_multi(Y.down, 0, H, D.act, D2FF, D.out, H, DBLK);
+        if (d0) df2_dump("s0_down.bin", D.out, (size_t) DBLK * H * 4);
+        kd2_conv<<<DBLK, 256>>>(D.out, D2.coef, Y.mc_base, 1, D.x);
+        prev = D.x;
+        if (dump) {
+            df2_dump(("layer" + std::to_string(i) + ".bin").c_str(), D.x, (size_t) DBLK * H * 4);
+            df2_dump(("res" + std::to_string(i) + ".bin").c_str(), D.res, (size_t) DBLK * H * 4);
+            df2_dump(("k" + std::to_string(i) + ".bin").c_str(), Y.K, (size_t) Y.cap * KVD * 2);
+            df2_dump(("v" + std::to_string(i) + ".bin").c_str(), Y.V, (size_t) Y.cap * KVD * 2);
+        }
+    }
+    kd_add_rms<<<DBLK, 512>>>(D.x, D.res, D2.norm, D.out, 0);
+    const float* rows = D.out + H;
+    gemv_multi(E.unembed, 0, VOCAB, rows, H, D.base, VOCAB, D2SLOTS);
+    kd2_topk1<<<dim3(D2NB, D2SLOTS), 256>>>(D.base, D2.tv, D2.ti);
+    kd2_topk2<<<D2SLOTS, 256>>>(D2.tv, D2.ti, D2.cand, D2.cval);
+    gemv_multi(D2.hproj, 0, D2RANK, rows, H, D2.hp, D2RANK, D2SLOTS);
+    kd2_walk<<<1, 512>>>(D2.cand, D2.cval, D2.hp, D2.pred.d, D2.succ.d, D.drafts);
+    if (dump) {
+        df2_dump("final.bin", D.out, (size_t) DBLK * H * 4);
+        df2_dump("logits.bin", D.base, (size_t) D2SLOTS * VOCAB * 4);
+        df2_dump("cand.bin", D2.cand, (size_t) D2SLOTS * D2TOPK * 4);
+        df2_dump("cval.bin", D2.cval, (size_t) D2SLOTS * D2TOPK * 4);
+        df2_dump("hp.bin", D2.hp, (size_t) D2SLOTS * D2RANK * 4);
+        df2_dump("drafts.bin", D.drafts, DBLK * 4);
+        FILE* f = std::fopen((std::string(g_df2_dump) + "/meta2.txt").c_str(), "w");
+        if (f) { std::fprintf(f, "p %d\n", p); std::fclose(f); }
+        g_df2_dump_blk = false;
+    }
+}
+
 void draft_load(const std::string& dir) {
+    if (const char* dd = std::getenv("INK2_DRAFTER")) { df2_load(dd); return; }
     Ckpt mk;
     mk.path = dir + "/mtp.safetensors";
     const std::string e = strata::image::st_read_header(mk.path, mk.st);
@@ -6310,6 +6609,7 @@ void draft_load(const std::string& dir) {
 
 // context K / V of the committed positions pos0 .. pos0 + n - 1 from their target features (rows of feat, [4][H] each)
 void draft_context(const float* feat, int pos0, int n) {
+    if (g_df2) { df2_context(feat, pos0, n); return; }
     for (int r0 = 0; r0 < n; r0 += DBLK) {
         const int m = std::min(DBLK, n - r0);
         for (int i = 0; i < DL; ++i) {
@@ -6322,6 +6622,7 @@ void draft_context(const float* feat, int pos0, int n) {
 }
 // Markov context from the last committed position's features (one row [4][H])
 void draft_frnn(const float* feat_row) {
+    if (g_df2) return;   // DFlash 2 has no recurrent head
     kd_mix_rms<<<1, 256>>>(feat_row, D.alpha + 12, D.mk_dflare, D.frnn);
     gemv(D.rf, D.frnn, D.cf);
     add_b(D.cf, D.rnn_bias, D.cf, 3 * MR);
@@ -6332,6 +6633,8 @@ cudaGraphExec_t g_draft_exec = nullptr;
 void draft_run(int tok, int p) {
     upload_embed(tok);
     CK(cudaMemcpyAsync(D.drafts, &tok, 4, cudaMemcpyHostToDevice));
+    static bool first_block = true;
+    if (g_df2 && g_df2_dump && first_block) { first_block = false; g_df2_dump_blk = true; draft_device(p); return; }   // eager once, dumped
     if (!E.graph) { draft_device(p); return; }
     CK(cudaMemcpyToSymbolAsync(d_vpos, &p, 4, 0, cudaMemcpyHostToDevice, cudaStreamPerThread));
     if (!g_draft_exec) {
@@ -6345,6 +6648,7 @@ void draft_run(int tok, int p) {
 }
 // the block's device work, p < 0: read from d_vpos
 void draft_device(int p) {
+    if (g_df2) { df2_device(p); return; }
     rms(E.emb_in, E.embed_norm, D.x);
     for (int r = 1; r < DBLK; ++r) copy(D.x + (size_t) r * H, D.mask_embed, H);
     const float* mlp_out = D.x;
@@ -6352,12 +6656,12 @@ void draft_device(int p) {
         DLayer& Y = D.L[i];
         kd_add_rms<<<DBLK, 512>>>(mlp_out, D.res, Y.in_ln, D.xn, i == 0);
         gemv_multi(Y.qkv, 0, DQKV, D.xn, H, D.qkv, DQKV, DBLK);
-        kd_qk_rope_store<<<dim3(NQ + NKV, DBLK), HD>>>(D.qkv, Y.q_norm, Y.k_norm, p, Y.K, Y.V, Y.cap);
+        kd_qk_rope_store<<<dim3(NQ + NKV, DBLK), HD>>>(D.qkv, Y.q_norm, Y.k_norm, p, Y.K, Y.V, Y.cap, NQ);
         // split count fixed by the layer's reach (graph-capturable); empty splits write max = -inf, skipped by the merge
-        const int reach = Y.local ? WINDOW + DBLK : E.ctx;
+        const int reach = Y.local ? g_dwin + DBLK : E.ctx;
         const int ns = std::min(DSPLIT_MAX, std::max(1, (reach + DSPLIT_KEYS - 1) / DSPLIT_KEYS));
-        kd_attn_partial<<<dim3(NQ, ns), 128>>>(D.qkv, Y.K, Y.V, Y.cap, p, g_draft_abl == 2 ? 2 : Y.local, D.pm, D.pl, D.po);
-        kd_attn_merge<<<dim3(NQ, DBLK), HD>>>(D.pm, D.pl, D.po, ns, D.att);
+        kd_attn_partial<<<dim3(NQ, ns), 128>>>(D.qkv, Y.K, Y.V, Y.cap, p, g_draft_abl == 2 ? 2 : Y.local, D.pm, D.pl, D.po, NQ);
+        kd_attn_merge<<<dim3(NQ, DBLK), HD>>>(D.pm, D.pl, D.po, ns, D.att, NQ);
         gemv_multi(Y.o, 0, H, D.att, QD, D.out, H, DBLK);
         kd_add_rms<<<DBLK, 512>>>(D.out, D.res, Y.post_ln, D.xn, 0);
         gemv_multi(Y.gu, 0, 2 * DFF, D.xn, H, D.gu, 2 * DFF, DBLK);
