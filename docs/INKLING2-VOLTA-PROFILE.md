@@ -67,6 +67,28 @@ Launch overhead is therefore not where the time goes: the CUDA graph already hid
 
 **Other launch facts (ncu).**  `k_gemv_q8_qkv<4>` uses 100 registers and is limited to 2 blocks per SM (22 % achieved occupancy, 1.68 waves); the expert kernels use 48 registers, 2.88 waves and 56 % occupancy.
 
+## Third round: the two larger changes, tested as spikes first (V100, expert gate_up GEMV, 24 MB per launch)
+Both were measured in microbenchmarks (`tools/volta_bw/gemv_steps.cu`, `gemv_dec.cu`) before any engine work.
+
+**Persistent decode kernel / prefetching the next layer into L2: falsified.**
+- Touching the first 1 to 5 MB of the kernel's weights into L2 just before it runs changes it from 44.6 to 44.2 us (0.9 %), where a DRAM-bound kernel would save 1.4 us per MB.
+- With the weights fully L2-resident (one expert read eight times, 3 MB, no DRAM traffic) the kernel still takes 33.4 us, against 43.1 us DRAM-fed.
+  So the kernel is not limited by DRAM bandwidth; about 33 us of its time is its own issue and latency chain.
+- The V100's 6 MB L2 also holds under a quarter of one expert pass (24 MB), so prefetching could only ever have helped a little.
+
+**Cutting the per-weight decode / tensor cores: the ceiling is small.**
+| variant (gate_up, 8 experts) | DRAM-fed | L2-resident |
+| --- | --- | --- |
+| engine: half2 decode + two F2F per pair | 42.8 us | 33.3 us |
+| PRMT tables (bit-identical outputs, checked on random data) | 42.9 | 36.7 |
+| float-direct shift/or + FMUL | 41.8 | 35.9 |
+| decode free (wrong values, floor only) | 38.0 | 28.3 |
+| weights + scales + activations loaded, no arithmetic at all | 34.4 | |
+- A different decode cannot beat the engine's by more than noise: the PRMT version, which does fewer F2F conversions, is not faster.
+- Even a free decode saves only 4.8 us of 42.8 (11 %).  Removing all arithmetic, which is the best case for any tensor-core path, saves 8.7 us (20 %) of this kernel, i.e. at most about 6 % of a decode step.
+- A tensor-core path would also need fp16 activations (the engine keeps fp32 here), so it changes the numerics, and on Volta the m8n8k4 fragments waste 7/8 of the columns of a single-token GEMV.  Not worth building.
+- The load pieces cost more than the arithmetic: scale loads alone add 3.8 us (29.6 to 33.4), x loads 1 us.  A different scale layout (e.g. one word per lane per four trips) is the one remaining bit-identical idea, worth at most 1 to 2 % of the step.
+
 ## Tried, no gain (reverted)
 - launch-shape knobs `INK2_RPW`, `INK2_SEL_RPW`, `INK2_GEMV_MINB`: flat within noise (79 to 82);
 - unroll 3 of the expert GEMV loop: 80.2 (K = 1152 has 4.5 trips), unroll 3 for gate_up only: 82.0 against 82.5 although the microbenchmark gained 6.5 %;

@@ -93,6 +93,44 @@ void run(const char* tag, uint8_t* buf, size_t eb, float* x, int rows, int K, fl
     const double us = ms * 1000.0 / it, bytes = 8.0 * rows * (K / 2 + K / 16);
     printf("%-34s %6.1f us  %6.0f GB/s\n", tag, us, bytes / (us * 1e-6) / 1e9);
 }
+
+__global__ void k_touch(const uint8_t* __restrict__ p, size_t n, float* sink) {
+    float a = 0;
+    for (size_t i = ((size_t) blockIdx.x * blockDim.x + threadIdx.x) * 16; i < n; i += (size_t) gridDim.x * blockDim.x * 16) { uint4 v = __ldg(reinterpret_cast<const uint4*>(p + i)); a += v.x ^ v.w; }
+    if (a == 1.2345f) *sink = a;
+}
+// Upper bound for "prefetch the next kernel's weights into L2 while the small kernels run": time the real kernel after the first P MB of its weights were touched.
+// The 8 experts' regions are spread over eb-sized strides, so P MB are split evenly over the 8 experts.
+void prewarm(uint8_t* buf, size_t eb, float* x, int rows, int K, float* out, int nbuf, float* sink) {
+    const dim3 grid((rows + 15) / 16, 8);
+    cudaEvent_t a, b; cudaEventCreate(&a); cudaEventCreate(&b);
+    for (double P : {0.0, 1.0, 2.0, 3.0, 4.0, 5.0}) {
+        float tot = 0; const int it = 40;
+        for (int i = 0; i < it + 4; ++i) {
+            uint8_t* base = buf + (size_t) (i % nbuf) * 8 * eb;
+            // evict: stream a different buffer first
+            k_touch<<<640, 256>>>(buf + (size_t) ((i + 2) % nbuf) * 8 * eb, 8 * eb, sink);
+            const size_t per = (size_t) (P * 1e6 / 8);
+            if (per) for (int e = 0; e < 8; ++e) k_touch<<<80, 256>>>(base + e * eb, per, sink);
+            cudaEventRecord(a);
+            k_step<true, true, true, 2><<<grid, 256>>>(base, eb, x, rows, K, out);
+            cudaEventRecord(b); cudaEventSynchronize(b);
+            float ms; cudaEventElapsedTime(&ms, a, b); if (i >= 4) tot += ms;
+        }
+        printf("  L2 pre-warmed %.0f MB of the weights: kernel %6.1f us\n", P, tot * 1000.0 / it);
+    }
+}
+
+// Control: all 8 blocks-rows of experts read the SAME expert (expert_bytes = 0): 3.2 MB, everything after the first touch hits L2.  What is left is the kernel's own issue / latency time.
+void l2_resident(uint8_t* buf, size_t eb, float* x, int rows, int K, float* out) {
+    const dim3 grid((rows + 15) / 16, 8);
+    cudaEvent_t a, b; cudaEventCreate(&a); cudaEventCreate(&b);
+    for (int w = 0; w < 6; ++w) k_step<true, true, true, 2><<<grid, 256>>>(buf, 0, x, rows, K, out);
+    cudaDeviceSynchronize(); cudaEventRecord(a);
+    for (int i = 0; i < 60; ++i) k_step<true, true, true, 2><<<grid, 256>>>(buf, 0, x, rows, K, out);
+    cudaEventRecord(b); cudaEventSynchronize(b); float ms; cudaEventElapsedTime(&ms, a, b);
+    printf("  weights L2-resident (one expert read 8x, %.1f MB): kernel %6.1f us\n", (double) eb / 1e6, ms * 1000.0 / 60);
+}
 int main() {
     const int rows = 2304, K = 2304; const size_t eb = (size_t) rows * (K / 2 + K / 16); const int nbuf = 4;
     uint8_t* buf; float *x, *out; cudaMalloc(&buf, eb * 8 * nbuf); cudaMalloc(&x, 8 * K * 4); cudaMalloc(&out, 8 * rows * 4);
@@ -110,5 +148,6 @@ int main() {
       printf("down shape (%d rows x K %d)\n", rows2, K2);
       run<true, true, true, 2>("  current (unroll 2)", buf, eb2, x, rows2, K2, out, nbuf);
       run_hoist<5>("  all loads hoisted (5 trips)", buf, eb2, x, rows2, K2, out, nbuf); }
+    { float* sink; cudaMalloc(&sink, 4); printf("prewarm experiment, gate_up shape\n"); prewarm(buf, eb, x, rows, K, out, nbuf, sink); l2_resident(buf, eb, x, rows, K, out); }
     return 0;
 }
