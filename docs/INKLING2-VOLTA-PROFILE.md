@@ -117,6 +117,20 @@ Max relative error against a double-precision reference with fp16-rounded x: 5e-
 - The fixed overhead: `k_mma_q8_multi` (7.5 ms against about 5 ms for the single-stream int8 GEMVs) and the multi-sequence small kernels.  A native-layout dense int8 kernel built like the one above is the candidate: about 3 ms of a 35 ms step (about 9 %) at 4 sequences, more at 2 to 3 where the fixed part dominates.
 - Nothing cheap on the expert side: the bytes are what they are.
 
+## Fifth round: what other V100 projects do (research notes: `rig-research/cachyos-t5810/v100-research/NOTES.md`)
+v100-skinny (MIT) and its MoE fork volta-nvfp4 run NVFP4 models on V100 with hand-written `mma.m8n8k4` kernels that reach 680 GB/s at M=1 (77 % of a measured 879 GB/s ceiling); anyei/llamacpp-v100 ported the same mapping to the GGUF quantizations.
+The mapping: weights on the N side of the MMA, all four quad-pairs sharing one activation fragment, weights prepacked at load into fragment order (nibble-interleaved so the decoder's half2 output is the B fragment), no shared memory in the main loop, K split over warps.
+My own tensor-core kernel put weights on the A side with x staged in shared memory and stalled at 48.7 us for exactly that reason.
+
+`tools/volta_bw/gemv_qpn.cu` ports their design for an expert-indirected launch and checks it against a double-precision reference (error 2e-7):
+| tokens per expert | 1 | 2 | 4 | 8 |
+| --- | --- | --- | --- | --- |
+| CUDA cores, engine shape | 47.5 us | 55.7 | 89.7 | 142.8 |
+| QPN2 design | **36.4 us** | **36.4** | **36.7** | **41.0** |
+That is 23 % faster at one token per expert, which is the decode regime, and flat up to four tokens.  36 us is about the 34 us floor of loading all weights, scales and activations with no arithmetic.
+Expected effect if the engine adopts it (expert kernels only, from the profiles above): plain decode 12.1 ms to about 11 ms (82 to about 90 tok/s), 4-sequence batched step 38 ms to about 34 ms (about 11 %).
+It uses fp16 activations (x rounded to fp16) with fp32 accumulation, like the Turing tensor-core path, so tokens will not be bit-identical to the CUDA-core path.
+
 ## Tried, no gain (reverted)
 - launch-shape knobs `INK2_RPW`, `INK2_SEL_RPW`, `INK2_GEMV_MINB`: flat within noise (79 to 82);
 - unroll 3 of the expert GEMV loop: 80.2 (K = 1152 has 4.5 trips), unroll 3 for gate_up only: 82.0 against 82.5 although the microbenchmark gained 6.5 %;
