@@ -184,6 +184,31 @@ Checks that ruled out other explanations: the drafts align with the true tokens 
 - bf16 dense weights raise acceptance by about 3 % for either drafter but cost 10 tok/s: not worth it.
 - Taking the better of the two drafters per prompt gives 123.5 tok/s (+3.8 % over either alone).
 
+## Eighth round: where a speculative cycle goes (V100, QPN on, `INK2_SPEC_BENCH`, nsys, `tools/dflash2/phase_kernels.py`)
+`INK2_SPEC_BENCH=N` times the phases of one cycle in isolation (and `INK2_SPEC_BENCH_ONLY=draft|verify|ctx|plain` runs just one so nsys attributes kernels cleanly).
+| phase | ms | note |
+| --- | --- | --- |
+| draft, DSpark | 4.7 to 4.9 | graph + copy of the 7 drafts |
+| draft, DFlash 2 | 5.6 to 5.9 | |
+| 8-token verify | 42 to 48 | the same at a 36-token and an 800-token prompt: not context-bound |
+| drafter context update | 0.2 (1 row), 0.5 (8 rows) | negligible |
+| plain decode step, for reference | 11.6 to 14.8 | |
+So a cycle is about 90 % verify.  The batched-decode path does the same 8-token workload (8 sequences) in 33 ms; the verify is slower because it runs the prefill-style kernels.
+
+**Verify, per kernel (ms per 8-token verify, steady-state kernels only; the load / prompt one-offs removed):**
+| kernel | ms | calls | |
+| --- | --- | --- | --- |
+| `k_mma_q8_multi` dense int8, emulated tensor core | 13.4 | 162 (83 us each) | about 3x its bandwidth floor (2.9 GB of dense weights, 4 ms at 700 GB/s) |
+| `k_qpn_grp` NVFP4 experts | 12.8 | 88 | near the memory floor |
+| `kb_attn_tc` verify attention | 5.0 | 50 | the batched-decode attention kernels take about 30 us a call |
+| `k_moe_gemv_grp` the 4 MXFP8 layers (not repacked) | 3.5 | 8 (438 us each) | CUDA cores |
+| about 15 small kernels (conv, rel logits, gate mix, merge, plan, swiglu, router GEMV ...) | about 11.5 | about 1,500 | 3 to 26 us each |
+
+**Draft step.**  DFlash 2: 4.4 ms of its 5.9 are `k_gemv_bf16_multi` (the drafter's dense layers run in bf16; `INK2_DF2_Q8=1` makes them int8) and 1.9 ms is the 7-row LM head (`k_mma_q8_multi`, 6252 blocks, about 3x its floor).  DSpark: 3.6 ms in `k_mma_q8_multi` calls (the LM head and its dense layers).
+
+**What follows.**  The dense int8 path (`k_mma_q8_multi`, Volta m16n8k8 emulated through m8n8k4) is the largest single cost of a verify (13.4 ms), of the draft step, and of batched decode (7.5 ms of a 4-sequence step).  A QPN8-style kernel (weights on the MMA N side, one shared fp16 activation fragment, weights repacked into fragment order, K split over warps; v100-skinny reaches 82 % of the read ceiling at M <= 8 for 8-bit weights) would take it to about the bandwidth floor: about 9 ms off a verify (about 20 % of a cycle), about 3.5 ms off the DFlash 2 draft step and about 4 ms off a 4-sequence batched step, with fp16 instead of int8 activations (more accurate).
+Then, in order of size: the verify attention through the batched-decode kernels (about 3 to 4 ms), the MXFP8 layers (about 2 ms), small-kernel fusion (about 3 ms at best).
+
 ## Tried, no gain (reverted)
 - launch-shape knobs `INK2_RPW`, `INK2_SEL_RPW`, `INK2_GEMV_MINB`: flat within noise (79 to 82);
 - unroll 3 of the expert GEMV loop: 80.2 (K = 1152 has 4.5 trips), unroll 3 for gate_up only: 82.0 against 82.5 although the microbenchmark gained 6.5 %;
