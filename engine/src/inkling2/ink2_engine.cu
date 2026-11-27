@@ -230,6 +230,12 @@ __device__ __forceinline__ uint32_t e2m1x2_h(uint32_t byte) {
     const uint32_t a = (byte & 0xFu) | ((byte & 0xF0u) << 12);
     return ((a & 0x00080008u) << 12) | ((a & 0x00070007u) << 9);
 }
+// nibbles k and k + 4 of a word shifted right by 4k (t): both in half2 lanes (nibble k in bits 0-3, nibble k + 4 in bits 16-19), as e2m1x2_h places a byte's two:
+// fp32 pair {nibble k, nibble k + 4} * 2^-14.  Four of these (k = 0..3) decode a 32-bit word of 8 nibbles with about half the operations of four byte decodes.
+__device__ __forceinline__ float2 e2m1_k4(uint32_t t) {
+    const uint32_t h = ((t & 0x00080008u) << 12) | ((t & 0x00070007u) << 9);
+    return __half22float2(*reinterpret_cast<const __half2*>(&h));
+}
 // two e4m3 bytes (in bits 0-7 and 16-23) -> fp32 values * 2^-8 (fp16 placement, exact incl. subnormals)
 __device__ __forceinline__ float2 e4m3x2(uint32_t a) {
     const uint32_t h = ((a & 0x00800080u) << 8) | ((a & 0x007F007Fu) << 7);
@@ -283,10 +289,10 @@ __global__ void k_gemv_nvfp4_sel(const uint8_t* const* __restrict__ tab,
         const float4 a = __ldg(x4 + 2 * i), b = __ldg(x4 + 2 * i + 1);
 #pragma unroll
         for (int r = 0; r < R; ++r) {
-            const float2 p0 = e2m1x2(v[r] & 0xff), p1 = e2m1x2((v[r] >> 8) & 0xff), p2 = e2m1x2((v[r] >> 16) & 0xff),
-                         p3 = e2m1x2(v[r] >> 24);
-            const float part = p0.x * a.x + p0.y * a.y + p1.x * a.z + p1.y * a.w + p2.x * b.x + p2.y * b.y +
-                               p3.x * b.z + p3.y * b.w;
+            // nibble j of the word times x[8 i + j], summed in the order j = 0..7 as before: the values are the same floats, only the decode is cheaper
+            const float2 q0 = e2m1_k4(v[r]), q1 = e2m1_k4(v[r] >> 4), q2 = e2m1_k4(v[r] >> 8), q3 = e2m1_k4(v[r] >> 12);
+            const float part = q0.x * a.x + q1.x * a.y + q2.x * a.z + q3.x * a.w + q0.y * b.x + q1.y * b.y +
+                               q2.y * b.z + q3.y * b.w;
             acc[r] += part * e4[sc[r]];
         }
     }
