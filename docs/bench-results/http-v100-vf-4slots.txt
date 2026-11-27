@@ -1,9 +1,0 @@
-######## V100 32GB (under vf)
-1 stream:
-all 1 decoding at once for 5.7 s: 298 tokens = 51.8 tok/s aggregate
-benchmark-style 11K prompt:
-seed 1: prompt 11199 tokens, first token after 21.0 s (534 tok/s read), 298 tokens, decode 15.5 tok/s
-seed 2: prompt 11139 tokens, first token after 55.6 s (200 tok/s read), 298 tokens, decode 8.4 tok/s
-4 short streams:
-all 4 decoding at once for 82.1 s: 1168 tokens = 14.2 tok/s aggregate
-4 long prompts, cold:

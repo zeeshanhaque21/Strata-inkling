@@ -50,7 +50,7 @@ The decode and FMA work costs about 9 us although the ALUs are not full: loads a
 | NVFP4 expert GEMV: a word decoded as four half2 pairs {n_k, n_k+4} | 82.4 (+1.5 %) |
 | together | **+3.8 %** |
 
-## Second round (branch `volta-fuse`)
+## Second round
 Three measurements, one kept change and one disproved estimate.
 
 **Shared-memory bank conflicts in the dense int8 GEMVs (kept).**  ncu (`ncu-metrics.sh`, `ncu-q8-metrics*.csv`) showed that 75 % of the shared-load wavefronts of `k_gemv_q8` and `k_gemv_q8_qkv` were bank conflicts:
@@ -117,7 +117,7 @@ Max relative error against a double-precision reference with fp16-rounded x: 5e-
 - The fixed overhead: `k_mma_q8_multi` (7.5 ms against about 5 ms for the single-stream int8 GEMVs) and the multi-sequence small kernels.  A native-layout dense int8 kernel built like the one above is the candidate: about 3 ms of a 35 ms step (about 9 %) at 4 sequences, more at 2 to 3 where the fixed part dominates.
 - Nothing cheap on the expert side: the bytes are what they are.
 
-## Fifth round: what other V100 projects do (research notes: `rig-research/cachyos-t5810/v100-research/NOTES.md`)
+## Fifth round: what other V100 projects do 
 v100-skinny (MIT) and its MoE fork volta-nvfp4 run NVFP4 models on V100 with hand-written `mma.m8n8k4` kernels that reach 680 GB/s at M=1 (77 % of a measured 879 GB/s ceiling); anyei/llamacpp-v100 ported the same mapping to the GGUF quantizations.
 The mapping: weights on the N side of the MMA, all four quad-pairs sharing one activation fragment, weights prepacked at load into fragment order (nibble-interleaved so the decoder's half2 output is the B fragment), no shared memory in the main loop, K split over warps.
 My own tensor-core kernel put weights on the A side with x staged in shared memory and stalled at 48.7 us for exactly that reason.
@@ -131,11 +131,11 @@ That is 23 % faster at one token per expert, which is the decode regime, and fla
 Expected effect if the engine adopts it (expert kernels only, from the profiles above): plain decode 12.1 ms to about 11 ms (82 to about 90 tok/s), 4-sequence batched step 38 ms to about 34 ms (about 11 %).
 It uses fp16 activations (x rounded to fp16) with fp32 accumulation, like the Turing tensor-core path, so tokens will not be bit-identical to the CUDA-core path.
 
-## Sixth round: QPN2 experts in the engine (branch `volta-qpn`, `INK2_QPN=1`, sm_70 only)
+## Sixth round: QPN2 experts in the engine (`INK2_QPN=1`, sm_70 only)
 The NVFP4 expert layers (0 to 19) are repacked once at load, in place, into the fragment order of `mma.m8n8k4` (a layer is copied to a 0.53 GiB scratch and repacked back from it, so there is one copy: 17.21 GiB in VRAM against 16.67 GiB without).
 Kernels: `k_qpn_sel` (one token per expert, plain decode), `k_qpn_grp` (the plan tiles of `kb_moe_plan`, up to 8 rows per expert in one pass over the weights; batched decode and speculative verification), `k_qpn_repack` / `k_qpn_unpack`.
 Chunks larger than `SMALL_T` unpack the layer into the scratch (checkpoint order) and run the existing prefill GEMM on it, with the layer's tables swapped for the call.
-Design: v100-skinny (MIT, Dennis Vertzyas); see `rig-research/cachyos-t5810/v100-research/NOTES.md`.  The expert factor goes into the half2 scale (the e4m3 block scale alone times 2^14 overflows fp16 for scales above 4; the checkpoint's factors are 3.8e-5 to 3.2e-4).
+Design: v100-skinny (MIT, Dennis Vertzyas); see the v100-skinny repository.  The expert factor goes into the half2 scale (the e4m3 block scale alone times 2^14 overflows fp16 for scales above 4; the checkpoint's factors are 3.8e-5 to 3.2e-4).
 
 V100, 4096 context, k8v4, speculation off, every run started from a card at or below 55 C (an 8-sequence run that did not hit 83 C and throttled, which made an earlier comparison invalid):
 | | `INK2_QPN=0` | `INK2_QPN=1` |
@@ -165,8 +165,8 @@ The remaining 1.3 s is 800 layer unpacks of 573 MB read and written at about 700
 - Below about 2 accepted drafts per verify it does not pay at all (85.9 against 87.5, 81.7 against 86.5): the acceptance of the built-in drafter is now the limit, not the expert kernels.
 - The same prompt can accept very differently with and without QPN (chat-qa: 4.62 against 0.60 drafts per verify), because the fp16 activations change a near-tie in the greedy path; do not read a per-prompt acceptance as a property of the kernels.
 
-## Seventh round: the DFlash 2 drafter (branch `dflash2`, `INK2_DRAFTER=<dir>`)
-`incoai/Inkling-2-Mini-DFlash2` (0.5B, 5 layers, grouped dynamic convs, top-16 candidate selector) is implemented in the engine next to the built-in DSpark drafter; design and sources in `rig-research/cachyos-t5810/v100-research/DRAFTERS.md`.
+## Seventh round: the DFlash 2 drafter (`INK2_DRAFTER=<dir>`)
+`incoai/Inkling-2-Mini-DFlash2` (0.5B, 5 layers, grouped dynamic convs, top-16 candidate selector) is implemented in the engine next to the built-in DSpark drafter; design and sources in the research notes (not included).
 Correctness: `tools/dflash2/ref_check.py` compares the engine's dump (`INK2_DF2_DUMP`) with an independent numpy implementation of the reference (SGLang `dflash.py`): context K/V, every layer, the final hidden state, candidates and the greedy walk all agree to about 1e-4 on two prompts.
 Bugs found on the way (all mine): the engine's attention kernels had the main model's 24 query heads compiled in (the drafter has 32); the output-side convolution used the input side's base kernel; the drafter needs the target's embed norm (0 of 7 drafts accepted without it, 6.2 with it).
 Checks that ruled out other explanations: the drafts align with the true tokens at offset 0 (anchor token correct in every block); shifting the three intermediate feature taps by one visit does not help (`INK2_TAPSHIFT`); the features captured on the one-token and verify paths are as close to a teacher-forced prefill as two prefills of different chunk sizes are to each other (median 1 to 13 % at the deep taps, the target's own chunk-size sensitivity, not a drafter-side error).
@@ -209,7 +209,7 @@ So a cycle is about 90 % verify.  The batched-decode path does the same 8-token 
 **What follows.**  The dense int8 path (`k_mma_q8_multi`, Volta m16n8k8 emulated through m8n8k4) is the largest single cost of a verify (13.4 ms), of the draft step, and of batched decode (7.5 ms of a 4-sequence step).  A QPN8-style kernel (weights on the MMA N side, one shared fp16 activation fragment, weights repacked into fragment order, K split over warps; v100-skinny reaches 82 % of the read ceiling at M <= 8 for 8-bit weights) would take it to about the bandwidth floor: about 9 ms off a verify (about 20 % of a cycle), about 3.5 ms off the DFlash 2 draft step and about 4 ms off a 4-sequence batched step, with fp16 instead of int8 activations (more accurate).
 Then, in order of size: the verify attention through the batched-decode kernels (about 3 to 4 ms), the MXFP8 layers (about 2 ms), small-kernel fusion (about 3 ms at best).
 
-## Ninth round: dense int8 GEMVs on the tensor cores (branch `dense-w8`, `INK2_DQ8=1`, sm_70)
+## Ninth round: dense int8 GEMVs on the tensor cores (`INK2_DQ8=1`, sm_70)
 `k_dq8` (tools/volta_bw/gemv_dq8.cu has the microbenchmark): the QPN2 mapping for int8 weights.  Weights on the MMA N side, one shared fp16 activation fragment (T <= 8 rows), weights repacked into fragment order, int8 -> fp16 exactly by a bias trick, the block scale folded in by one HMUL2 (its rounding to fp16 is 5e-4 relative per weight, below the int8 quantization), K split over 8 to 32 warps by the tile count.
 Microbenchmark, V100, 250 W: LM head 678 to 818 us (the emulated `k_mma_q8_multi`: 1,870 us), qkv / gate projection 35 us at 611 GB/s, `wo` 16 us, drafter down 36 us, 600 to 720 GB/s on the large shapes, error 2e-4 against fp64.
 In the engine it is a second, fragment-order copy of the int8 weights (about 2.4 GiB, built after `quantize_q8`, segment starts keep the projection's q / k / v slices addressable); T = 1 plain decode, the prefill dequant and every other reader still use the row-major copy.

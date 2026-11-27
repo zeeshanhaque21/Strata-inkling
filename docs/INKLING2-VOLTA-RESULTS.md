@@ -1,8 +1,8 @@
 # Inkling-2-Mini on a Tesla V100: every experiment, compared
 
-Strata `ink2` engine, V100 PCIe 32 GB (GPU 0 of the T5810 "cachyos"), Inkling-2-Mini official checkpoint, `INK2_Q8=15`, k8v4 KV.
+Strata `ink2` engine, Tesla V100 PCIe 32 GB, Inkling-2-Mini official checkpoint, `INK2_Q8=15`, k8v4 KV.
 Companion to `INKLING2-VOLTA-PROFILE.md` (the narrative, kernel by kernel) and `INKLING2-VOLTA.md` (the sm_70 bring-up).
-Raw logs: `docs/bench-results/v100-profile/`.  Branches (fork `zeeshanhaque21/Strata-inkling`): `volta-opt`, `volta-fuse`, `volta-qpn`, `dflash2`, `dense-w8`.
+Raw logs: `docs/bench-results/v100-profile/`.
 
 ## Test conditions
 

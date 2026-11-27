@@ -6,7 +6,7 @@
 set -u
 GPUS=${GPUS:-"0 1"}; CTX=${CTX:-131072}; KV=${KV:-i8}; RESERVE=${RESERVE:-800}; SPEC=${SPEC:-1}; PORT=${PORT:-8080}; HOST=${HOST:-127.0.0.1}
 CHUNK=${CHUNK:-1024}   # prefill chunk: 1024 reads prompts 41 % faster than 512 at 128K context; 2048 is +66 % but costs 12 % decode speed (smaller expert cache)
-MODEL=${MODEL:-/mnt/models/inkling-official}
+MODEL=${MODEL:?set MODEL to the Inkling-2-Mini checkpoint folder (the published safetensors)}
 HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(cd "$HERE/../../.." && pwd)
 ENGINE=${ENGINE:-$REPO/build-sm75/strata-ink2}
