@@ -1593,8 +1593,12 @@ __device__ __forceinline__ uint32_t q8_pair_h2(uint32_t w_xor, uint32_t sel) {  
     return *reinterpret_cast<const uint32_t*>(&r);
 }
 __device__ __forceinline__ void mma_m16n8k8(float& d0, float& d1, float& d2, float& d3, uint32_t a0, uint32_t a1, uint32_t b0) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
+    __trap();   // Volta has no m16n8k8: the host never launches k_mma_q8_multi there (g_mma is off below sm_75), this only lets sm_70 compile
+#else
     asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
                  : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3) : "r"(a0), "r"(a1), "r"(b0));
+#endif
 }
 __global__ void __launch_bounds__(256) k_mma_q8_multi(const int8_t* __restrict__ W, const __half* __restrict__ S,
                                                       const float* __restrict__ X, int ldx, float* __restrict__ Y, int ldy,
@@ -3005,7 +3009,7 @@ struct DMat {
 // tensor-core / int8 switches (env: INK2_Q8 mask, INK2_MMA, INK2_MMA_MOE, INK2_MMA_PLAIN)
 static const int g_q8 = std::getenv("INK2_Q8") ? std::atoi(std::getenv("INK2_Q8")) : 1;   // int8 dense weights, bit mask (0 = all BF16): 1 unembed, 2 wo, 4 proj, 8 the drafter's dense weights
 static const bool g_attn16 = !(std::getenv("INK2_ATTN16") && std::atoi(std::getenv("INK2_ATTN16")) == 0);
-static const bool g_mma = !(std::getenv("INK2_MMA") && std::atoi(std::getenv("INK2_MMA")) == 0);
+static bool g_mma = !(std::getenv("INK2_MMA") && std::atoi(std::getenv("INK2_MMA")) == 0);   // (off at start on a card without mma.m16n8k8: sm_70)
 static const bool g_mma_moe = !(std::getenv("INK2_MMA_MOE") && std::atoi(std::getenv("INK2_MMA_MOE")) == 0);
 static const bool g_mma_plain = !(std::getenv("INK2_MMA_PLAIN") && std::atoi(std::getenv("INK2_MMA_PLAIN")) == 0);
 
@@ -6436,6 +6440,13 @@ int main(int argc, char** argv) {
     if (E.kvpool > 0 && E.kvpool < E.ctx) {
         std::fprintf(stderr, "kv-pool: %ld tokens is less than the context %d: raised to the context (one sequence must be able to reach it)\n", E.kvpool, E.ctx);
         E.kvpool = E.ctx;
+    }
+    {   // a card below sm_75 (Volta) has no mma.m16n8k8: the int8 GEMV for T <= 8 uses its CUDA-core version
+        int dev = 0, maj = 0, mnr = 0;
+        CK(cudaGetDevice(&dev));
+        CK(cudaDeviceGetAttribute(&maj, cudaDevAttrComputeCapabilityMajor, dev));
+        CK(cudaDeviceGetAttribute(&mnr, cudaDevAttrComputeCapabilityMinor, dev));
+        if (maj * 10 + mnr < 75 && g_mma) { g_mma = false; std::fprintf(stderr, "sm_%d%d: no mma.m16n8k8, the tensor-core int8 GEMV is off (INK2_MMA=0)\n", maj, mnr); }
     }
     if (E.grow || E.kvpool > 0) vmm_init();
     if (dir.empty() || (ids.empty() && !serve && vis_pixels.empty())) {
