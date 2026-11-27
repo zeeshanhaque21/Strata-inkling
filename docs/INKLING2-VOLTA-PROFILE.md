@@ -50,6 +50,23 @@ The decode and FMA work costs about 9 us although the ALUs are not full: loads a
 | NVFP4 expert GEMV: a word decoded as four half2 pairs {n_k, n_k+4} | 82.4 (+1.5 %) |
 | together | **+3.8 %** |
 
+## Second round (branch `volta-fuse`)
+Three measurements, one kept change and one disproved estimate.
+
+**Shared-memory bank conflicts in the dense int8 GEMVs (kept).**  ncu (`ncu-metrics.sh`, `ncu-q8-metrics*.csv`) showed that 75 % of the shared-load wavefronts of `k_gemv_q8` and `k_gemv_q8_qkv` were bank conflicts:
+a lane reads 16 consecutive activations per step, so lanes sit 64 B apart and four lanes of a quarter-warp share their banks.
+The staged x now has one padding float4 per eight (`xpad4`, `stage_x_padded`); the conflict share fell from 75 % to under 0.5 % and the shared-load wavefronts from 620 k / 885 k to 155 k / 222 k.
+Kernel time: `k_gemv_q8<1>` 23.8 to 20.4 us, `k_gemv_q8<4>` (qkv) 49 to 46 us.  Whole-step decode is unchanged within noise (82.5 tok/s before and after) because those kernels wait on DRAM, not on shared memory; the ncu-serialised step total fell from 15.87 to 15.18 ms.
+Same values in the same order, so the tokens are identical (hash `b3b55d972d`).
+
+**Fused launches (kept behind `INK2_FUSE=1`, off by default).**  `k_attn_partial` + `k_attn_merge`, `k_gemv_bf16_rowblock` + `k_router`, and `k_attn_tail` + the following `k_attnres`, each fused with a last-block-done counter that resets itself.
+Tokens are bit-identical (plain decode hash `b3b55d972d`; `--ms-test` 4 x 127 steps EQUIVALENT with both settings).  Speed: 82.2 to 82.3 tok/s fused against 82.5 unfused, so 0.3 % slower.
+
+**The "9 % from fusion" estimate was wrong.**  Nsight Systems (`nsys`, installed in `~/nsight-systems`; `gaps.py` reads its sqlite) shows the decode kernels occupy 93.7 % of the step's wall time; only 6.3 % (median gap 0.6 us) is idle between kernels.
+Launch overhead is therefore not where the time goes: the CUDA graph already hides it.  The small kernels cost their own run time (a ramp-up, a barrier, a tail), which fusion does not shorten.
+
+**Other launch facts (ncu).**  `k_gemv_q8_qkv<4>` uses 100 registers and is limited to 2 blocks per SM (22 % achieved occupancy, 1.68 waves); the expert kernels use 48 registers, 2.88 waves and 56 % occupancy.
+
 ## Tried, no gain (reverted)
 - launch-shape knobs `INK2_RPW`, `INK2_SEL_RPW`, `INK2_GEMV_MINB`: flat within noise (79 to 82);
 - unroll 3 of the expert GEMV loop: 80.2 (K = 1152 has 4.5 trips), unroll 3 for gate_up only: 82.0 against 82.5 although the microbenchmark gained 6.5 %;
@@ -59,6 +76,6 @@ The decode and FMA work costs about 9 us although the ALUs are not full: loads a
 ## Where the rest is
 One decode step reads about 4.1 GB from DRAM (5,601 MB over 1.4 steps in the ncu window).  At the 720 to 800 GB/s that streaming reads reach on this card that is 5.1 to 5.7 ms, about 175 to 195 tok/s;
 the step takes 12.1 ms.  The gap is about 25 % tiny kernels (3 to 11 us each, latency-bound, about 1,050 launches per step) and GEMVs that stream at 50 to 60 % of that.
-- Fusing the small kernels (attn_partial + merge via a last-block-done counter, router into its neighbours, gate chains): about 1 to 2 % each, about 9 % in all.
+- Fusing the small kernels: measured, see the second round (no gain; the step is 93.7 % kernel time).
 - The larger structural step is a persistent decode kernel that streams the next layer's weights while the current one computes; that is days of work, not a tuning pass.
 - A tensor-core NVFP4 / int8 expert path with weights loaded in Volta's own fragment layout (no lane shuffles) would remove the per-weight decode and FMAs from the CUDA cores; the shuffle-based emulation measured 27 % slower, the native layout is untested.
