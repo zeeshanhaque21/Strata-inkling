@@ -3010,8 +3010,8 @@ struct DMat {
 static const int g_q8 = std::getenv("INK2_Q8") ? std::atoi(std::getenv("INK2_Q8")) : 1;   // int8 dense weights, bit mask (0 = all BF16): 1 unembed, 2 wo, 4 proj, 8 the drafter's dense weights
 static const bool g_attn16 = !(std::getenv("INK2_ATTN16") && std::atoi(std::getenv("INK2_ATTN16")) == 0);
 static bool g_mma = !(std::getenv("INK2_MMA") && std::atoi(std::getenv("INK2_MMA")) == 0);   // (off at start on a card without mma.m16n8k8: sm_70)
-static const bool g_mma_moe = !(std::getenv("INK2_MMA_MOE") && std::atoi(std::getenv("INK2_MMA_MOE")) == 0);
-static const bool g_mma_plain = !(std::getenv("INK2_MMA_PLAIN") && std::atoi(std::getenv("INK2_MMA_PLAIN")) == 0);
+static bool g_mma_moe = !(std::getenv("INK2_MMA_MOE") && std::atoi(std::getenv("INK2_MMA_MOE")) == 0);
+static bool g_mma_plain = !(std::getenv("INK2_MMA_PLAIN") && std::atoi(std::getenv("INK2_MMA_PLAIN")) == 0);
 
 // Experts live in fixed-size slots of a device pool (one pool per format), each slot one expert as
 // [w13 | w13 scales | w2 | w2 scales] (part A = w13 + scales, part B = w2 + scales).  The kernels address an expert
@@ -6446,7 +6446,10 @@ int main(int argc, char** argv) {
         CK(cudaGetDevice(&dev));
         CK(cudaDeviceGetAttribute(&maj, cudaDevAttrComputeCapabilityMajor, dev));
         CK(cudaDeviceGetAttribute(&mnr, cudaDevAttrComputeCapabilityMinor, dev));
-        if (maj * 10 + mnr < 75 && g_mma) { g_mma = false; std::fprintf(stderr, "sm_%d%d: no mma.m16n8k8, the tensor-core int8 GEMV is off (INK2_MMA=0)\n", maj, mnr); }
+        if (maj * 10 + mnr < 75) {   // k_mma_q8_multi and k_moe_mma_grp are the two users of mma.m16n8k8
+            g_mma = g_mma_moe = g_mma_plain = false;
+            std::fprintf(stderr, "sm_%d%d: no mma.m16n8k8: the tensor-core int8 GEMV and MoE kernels are off (INK2_MMA=0, INK2_MMA_MOE=0, INK2_MMA_PLAIN=0)\n", maj, mnr);
+        }
     }
     if (E.grow || E.kvpool > 0) vmm_init();
     if (dir.empty() || (ids.empty() && !serve && vis_pixels.empty())) {
