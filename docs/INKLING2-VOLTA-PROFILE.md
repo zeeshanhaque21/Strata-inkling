@@ -165,6 +165,25 @@ The remaining 1.3 s is 800 layer unpacks of 573 MB read and written at about 700
 - Below about 2 accepted drafts per verify it does not pay at all (85.9 against 87.5, 81.7 against 86.5): the acceptance of the built-in drafter is now the limit, not the expert kernels.
 - The same prompt can accept very differently with and without QPN (chat-qa: 4.62 against 0.60 drafts per verify), because the fp16 activations change a near-tie in the greedy path; do not read a per-prompt acceptance as a property of the kernels.
 
+## Seventh round: the DFlash 2 drafter (branch `dflash2`, `INK2_DRAFTER=<dir>`)
+`incoai/Inkling-2-Mini-DFlash2` (0.5B, 5 layers, grouped dynamic convs, top-16 candidate selector) is implemented in the engine next to the built-in DSpark drafter; design and sources in `rig-research/cachyos-t5810/v100-research/DRAFTERS.md`.
+Correctness: `tools/dflash2/ref_check.py` compares the engine's dump (`INK2_DF2_DUMP`) with an independent numpy implementation of the reference (SGLang `dflash.py`): context K/V, every layer, the final hidden state, candidates and the greedy walk all agree to about 1e-4 on two prompts.
+Bugs found on the way (all mine): the engine's attention kernels had the main model's 24 query heads compiled in (the drafter has 32); the output-side convolution used the input side's base kernel; the drafter needs the target's embed norm (0 of 7 drafts accepted without it, 6.2 with it).
+Checks that ruled out other explanations: the drafts align with the true tokens at offset 0 (anchor token correct in every block); shifting the three intermediate feature taps by one visit does not help (`INK2_TAPSHIFT`); the features captured on the one-token and verify paths are as close to a teacher-forced prefill as two prefills of different chunk sizes are to each other (median 1 to 13 % at the deep taps, the target's own chunk-size sensitivity, not a drafter-side error).
+
+**Evaluation on 16 varied prompts** (800-token slices of real code, markdown and logs from this machine, 200 greedy tokens, QPN on, V100, every run from a card at or below 60 C; `tools/dflash2/corpus_summary.py`, raw log `docs/bench-results/v100-profile/drafter-corpus.log`):
+| drafter, dense weights | mean tok/s | accepted drafts per verify |
+| --- | --- | --- |
+| DSpark, int8 dense (production) | 118.5 | 3.65 |
+| **DFlash 2**, int8 dense | **119.0** | **3.90** |
+| DSpark, bf16 dense | 105.6 | 3.77 |
+| DFlash 2, bf16 dense | 109.0 | 4.03 |
+- DFlash 2 wins 11 of 16 prompts; on the 9 prompts where both generate identical text, 7 wins and +6.5 tok/s on average.  Per kind (tok/s, int8): code 122.4 against 119.4 (Python), 116.2 against 116.8 (CUDA), markdown 102.8 against 103.5, logs 145.1 against 144.4.
+- The published gap (acceptance length 4.8 to 5.0 against 3.5) is not reproduced: in greedy decoding the built-in drafter already accepts 3.65 per verify here, and DFlash 2's edge is about +7 % in acceptance.  The published figures are for sampling at temperature 1.
+- The "losers" of the first A/B (5,083-token code, chat-qa) were single-trajectory noise: the same prompt with QPN off (a different greedy continuation) gives DFlash 2 4.54 accepted per verify on chat-qa, and DSpark 0.60 on the same text; with QPN on it is 1.84 against 4.62.  Compare drafters only on identical text and over many prompts.
+- bf16 dense weights raise acceptance by about 3 % for either drafter but cost 10 tok/s: not worth it.
+- Taking the better of the two drafters per prompt gives 123.5 tok/s (+3.8 % over either alone).
+
 ## Tried, no gain (reverted)
 - launch-shape knobs `INK2_RPW`, `INK2_SEL_RPW`, `INK2_GEMV_MINB`: flat within noise (79 to 82);
 - unroll 3 of the expert GEMV loop: 80.2 (K = 1152 has 4.5 trips), unroll 3 for gate_up only: 82.0 against 82.5 although the microbenchmark gained 6.5 %;
